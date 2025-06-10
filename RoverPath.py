@@ -1,0 +1,125 @@
+# Full YOLOv8 with CLI-based Visualization, Hazard Scoring, and Rover Path Suggestion
+
+# Install necessary packages first:
+# pip install ultralytics opencv-python matplotlib
+
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+import os
+import heapq
+
+# Load trained YOLOv8 model
+try:
+    model = YOLO('best.pt')
+except Exception as e:
+    print(f"Error loading YOLO model: {e}")
+    exit(1)
+
+# Simple Hazard Map and Path Planning
+def generate_hazard_map(image_shape, detections):
+    hazard_map = np.zeros(image_shape[:2], dtype=np.float32)
+
+    for box in detections[0].boxes.xyxy:
+        x1, y1, x2, y2 = map(int, box[:4])
+        hazard_map[y1:y2, x1:x2] += 1.0  # Increase hazard score inside detected boxes
+
+    hazard_map = cv2.GaussianBlur(hazard_map, (25, 25), 0)
+    hazard_map /= np.max(hazard_map) + 1e-6  # Normalize to [0, 1]
+    return hazard_map
+
+# A* Pathfinding Algorithm
+def find_safe_path(hazard_map, start, goal):
+    rows, cols = hazard_map.shape
+    open_set = []
+    heapq.heappush(open_set, (0, start))
+    came_from = {}
+    g_score = {start: 0}
+
+    def heuristic(a, b):
+        return np.linalg.norm(np.array(a) - np.array(b))
+
+    while open_set:
+        _, current = heapq.heappop(open_set)
+
+        if current == goal:
+            path = []
+            while current in came_from:
+                path.append(current)
+                current = came_from[current]
+            path.append(start)
+            return path[::-1]
+
+        neighbors = [
+            (current[0] + dx, current[1] + dy)
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            if 0 <= current[0] + dx < rows and 0 <= current[1] + dy < cols
+        ]
+
+        for neighbor in neighbors:
+            tentative_g = g_score[current] + 1 + hazard_map[neighbor]
+            if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score = tentative_g + heuristic(neighbor, goal)
+                heapq.heappush(open_set, (f_score, neighbor))
+
+    return None
+
+# CLI Inference and Visualization Function
+def detect_with_cam(image_path):
+    if not os.path.isfile(image_path):
+        print(f"Error: The file '{image_path}' does not exist.")
+        return
+
+    image_bgr = cv2.imread(image_path)
+    if image_bgr is None:
+        print(f"Error: Unable to read the image at '{image_path}'. Please ensure it is a valid image file.")
+        return
+
+    detections = model.predict(image_bgr)
+
+    if len(detections) == 0:
+        print("No detections found.")
+        return
+
+    # Generate hazard map
+    hazard_map = generate_hazard_map(image_bgr.shape, detections)
+
+    # Define start and goal points for rover (corners of the image)
+    start = (0, 0)
+    goal = (image_bgr.shape[0] - 1, image_bgr.shape[1] - 1)
+
+    path = find_safe_path(hazard_map, start, goal)
+
+    # Draw detections and path
+    result_image = detections[0].plot()
+
+    if path:
+        for y, x in path:
+            cv2.circle(result_image, (x, y), 1, (0, 255, 0), -1)
+    else:
+        print("No safe path found.")
+
+    # Display results using matplotlib
+    plt.figure(figsize=(16, 8))
+
+    plt.subplot(1, 2, 1)
+    plt.title('YOLOv8 Detections and Path')
+    plt.imshow(cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+
+    plt.subplot(1, 2, 2)
+    plt.title('Hazard Map')
+    plt.imshow(hazard_map, cmap='hot')
+    plt.axis('off')
+
+    plt.show()
+
+if __name__ == "__main__":
+    image_path = input("Enter the path to the lunar image: ")
+    detect_with_cam(image_path)
+
+# Note: Grad-CAM and Gradio functionality are removed due to environment restrictions (missing torch and ssl modules).
+# This CLI-based version now includes hazard scoring and a simple rover path planning algorithm for enhanced utility.
