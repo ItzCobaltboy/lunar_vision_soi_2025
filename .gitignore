@@ -1,6 +1,6 @@
 .vscode
 Dataset/
-
+Dataset_sampled/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

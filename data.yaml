@@ -1,0 +1,7 @@
+
+    train: k:/VSCode/lunar_vision_soi_2025/Dataset/train/images
+    val: k:/VSCode/lunar_vision_soi_2025/Dataset/valid/images
+
+    nc: 1
+    names: ['crater']
+    
