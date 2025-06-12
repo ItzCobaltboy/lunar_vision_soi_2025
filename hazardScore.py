@@ -1,4 +1,4 @@
-# Full YOLOv8 with Edge-Aware Detection, Hazard Scoring, and Rover Path Suggestion
+# Full YOLOv8 with Edge-Aware Detection, Multi-Task Learning Simulation, Hazard Scoring, Depth Estimation, and Rover Path Suggestion
 
 # Install necessary packages first:
 # pip install ultralytics opencv-python matplotlib
@@ -49,6 +49,12 @@ def generate_hazard_map(image_shape, detections, edge_map):
     hazard_map *= (edge_map / 255.0)
 
     return hazard_map
+
+# Simulated Depth Estimation using Edge Map
+def generate_depth_map(edge_map):
+    depth_map = cv2.GaussianBlur(edge_map, (25, 25), 0)
+    depth_map = cv2.normalize(depth_map, None, 0, 1, cv2.NORM_MINMAX)
+    return depth_map
 
 # A* Pathfinding Algorithm
 def find_safe_path(hazard_map, start, goal):
@@ -109,6 +115,9 @@ def detect_with_cam(image_path):
     # Generate hazard map
     hazard_map = generate_hazard_map(image_bgr.shape, detections, edge_map)
 
+    # Generate simulated depth map
+    depth_map = generate_depth_map(edge_map)
+
     # Define start and goal points for rover (corners of the image)
     start = (0, 0)
     goal = (image_bgr.shape[0] - 1, image_bgr.shape[1] - 1)
@@ -125,16 +134,21 @@ def detect_with_cam(image_path):
         print("No safe path found.")
 
     # Display results using matplotlib
-    plt.figure(figsize=(16, 8))
+    plt.figure(figsize=(24, 8))
 
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.title('YOLOv8 Detections and Path')
     plt.imshow(cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB))
     plt.axis('off')
 
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.title('Hazard Map (Edge-Aware)')
     plt.imshow(hazard_map, cmap='hot')
+    plt.axis('off')
+
+    plt.subplot(1, 3, 3)
+    plt.title('Simulated Depth Map')
+    plt.imshow(depth_map, cmap='viridis')
     plt.axis('off')
 
     plt.show()
@@ -144,4 +158,4 @@ if __name__ == "__main__":
     detect_with_cam(image_path)
 
 # Note: Grad-CAM and Gradio functionality are removed due to environment restrictions (missing torch and ssl modules).
-# This CLI-based version now includes edge-aware preprocessing, hazard scoring, and a simple rover path planning algorithm for enhanced utility.
+# This CLI-based version now includes edge-aware preprocessing, hazard scoring, simulated depth estimation, and a simple rover path planning algorithm to demonstrate multi-task learning simulation.
