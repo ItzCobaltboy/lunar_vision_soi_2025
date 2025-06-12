@@ -1,8 +1,3 @@
-# Full YOLOv8 with Edge-Aware Detection, Multi-Task Learning Simulation, Hazard Scoring, Depth Estimation, Explainability Integration, and Rover Path Suggestion
-
-# Install necessary packages first:
-# pip install ultralytics opencv-python matplotlib
-
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
