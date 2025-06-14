@@ -11,6 +11,8 @@ def main():
     train_path = BASE_DIR.replace("\\", "/") + "/train/images"
     val_path = BASE_DIR.replace("\\", "/") + "/valid/images"
 
+
+    save_path = os.path.join(BASE_DIR, "yolo_model.pt")
     # Build YAML content
     yaml_content = f"""
     train: {train_path}
@@ -39,13 +41,13 @@ def main():
     results = model.train(
         data='simple_yolo_data.yaml',
         imgsz=416,              # Matches dataset, no resizing
-        epochs=15,
+        epochs=100,
         batch=-1,                
         device=0,
-        workers=2,
-        patience=30,
+        workers=3,
+        patience=20,
         project='lunar_craters',
-        name='nano_416_best',
+        name='nano_big_dataset',
         exist_ok=True,
         amp=True,
 
@@ -65,6 +67,9 @@ def main():
         close_mosaic=10
     )
     # Display training results summary
+
+    model.save(save_path)
+
     print(results)
 
 if __name__ == "__main__":
