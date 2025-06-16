@@ -25,10 +25,8 @@ The goal? Find **craters**. Only craters. Moon's pretty chill like that.
 │   ├── Simple_YOLO.py        ← Inference script to generate YOLO-style .txt labels
 │   ├── dataset_evaluator.py  ← Training script (if you feel like retraining)
 │   └── labels.zip            ← Our YOLO model's output on test set
-
 ├── custom_model/             ← Our handcrafted YOLO-style model
 │   └── custom_model.py       ← Model code + custom loss function
-
 ├── requirements.txt          ← Python dependencies
 ├── report.pdf                ← Our write-up (yeah, we went full LaTeX mode)
 └── README.md                 ← This file
