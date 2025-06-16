@@ -7,9 +7,13 @@ import heapq
 import streamlit as st
 from PIL import Image
 
+BASE_DIR = os.path.dirname(__file__)
+MODEL = os.path.join(BASE_DIR, "yolo_weights.pt")
+
+
 # Load trained YOLOv8 model
 try:
-    model = YOLO('best.pt')
+    model = YOLO(MODEL)
 except Exception as e:
     st.error(f"Error loading YOLO model: {e}")
     exit(1)

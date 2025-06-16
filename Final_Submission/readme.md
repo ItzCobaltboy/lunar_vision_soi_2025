@@ -14,6 +14,9 @@ We built two models:
 
 The goal? Find **craters**. Only craters. Moon's pretty chill like that.
 
+### BONUS!
+> Oh — and we’ve got a **Streamlit web interface** for running the model in your browser. Plug, click, detect.
+
 ---
 
 ## 🗂️ Folder Vibes
@@ -24,6 +27,7 @@ The goal? Find **craters**. Only craters. Moon's pretty chill like that.
 │   ├── yolo_weights.pt       ← Trained YOLOv8 weights
 │   ├── Simple_YOLO.py        ← Inference script to generate YOLO-style .txt labels
 │   ├── dataset_evaluator.py  ← Training script (if you feel like retraining)
+│   ├── webinterface.py       ← ⚡ Streamlit app for YOLO inference
 │   └── labels.zip            ← Our YOLO model's output on test set
 ├── custom_model/             ← Our handcrafted YOLO-style model
 │   └── custom_model.py       ← Model code + custom loss function
@@ -52,6 +56,12 @@ python dataset_evaluator.py
 
 Make sure you’ve got your test images ready — `.txt` labels will be saved in `labels/`.
 
+
+To run the web app:
+```bash
+cd yolo_model
+streamlit webinterface.py
+```
 ---
 
 ## 🧪 Custom Model (`custom_model/`)
