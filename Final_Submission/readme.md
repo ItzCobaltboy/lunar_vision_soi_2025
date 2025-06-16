@@ -38,8 +38,8 @@ The goal? Find **craters**. Only craters. Moon's pretty chill like that.
 
 This one’s good to go:
 
-- `Simple_YOLO.py`: run inference on test images, outputs YOLO-format `.txt` labels
-- `dataset_evaluator.py`: for retraining the YOLO model (optional)
+- `dataset_evaluator.py`: run inference on test images, outputs YOLO-format `.txt` labels
+- `Simple_YOLO.py`: for retraining the YOLO model (optional)
 - `labels.zip`: zipped up inference output for your evaluation
 - `yolo_weights.pt`: trained weights (YOLOv8N)
 
@@ -47,7 +47,7 @@ To run inference:
 
 ```bash
 cd yolo_model
-python Simple_YOLO.py
+python dataset_evaluator.py
 ```
 
 Make sure you’ve got your test images ready — `.txt` labels will be saved in `labels/`.
