@@ -17,11 +17,11 @@ def main():
     save_path = os.path.join(BASE_DIR, "yolo_model.pt")
     # Build YAML content
     yaml_content = f"""
-    train: {train_path}
-    val: {val_path}
+train: {train_path}
+val: {val_path}
 
-    nc: 1
-    names: ['crater']
+nc: 1
+names: ['crater']
     """
 
     # Save data.yaml in same folder as this script (or anywhere else)
