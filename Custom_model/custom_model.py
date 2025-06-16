@@ -59,9 +59,9 @@ def main():
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                             collate_fn=collate_fn, num_workers=2, pin_memory=True)
+                             collate_fn=collate_fn, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
     valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                             collate_fn=collate_fn, num_workers=2, pin_memory=True)
+                             collate_fn=collate_fn, num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=2)
     
     # Generate anchors using K-mean
     # Generate anchors
