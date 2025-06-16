@@ -118,6 +118,19 @@ def detect_with_cam(image_path):
     # Draw detections and path
     result_image = detections[0].plot()
 
+    # Extract prediction confidences
+    confidences = [box.conf.item() for box in detections[0].boxes]
+
+    # Create histogram figure
+    plt.figure(figsize=(6, 4))
+    plt.hist(confidences, bins=10, range=(0, 1), color='skyblue', edgecolor='black')
+    plt.title('Prediction Confidence Histogram')
+    plt.xlabel('Confidence')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    plt.show()
+
+
     if path:
         for y, x in path:
             cv2.circle(result_image, (x, y), 1, (0, 255, 0), -1)
@@ -125,7 +138,33 @@ def detect_with_cam(image_path):
         print("No safe path found.")
 
     # Display results using matplotlib
-    plt.figure(figsize=(16, 8))
+    plt.figure(figsize=(18, 6))
+
+    plt.figure(figsize=(18, 6))
+
+    # Detection with path
+    plt.subplot(1, 3, 1)
+    plt.title('YOLOv8 Detections and Path')
+    plt.imshow(cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+
+    # Hazard map
+    plt.subplot(1, 3, 2)
+    plt.title('Hazard Map (Edge-Aware)')
+    plt.imshow(hazard_map, cmap='hot')
+    plt.axis('off')
+
+    # Confidence histogram
+    plt.subplot(1, 3, 3)
+    plt.title('Prediction Confidence Histogram')
+    plt.hist(confidences, bins=10, range=(0, 1), color='skyblue', edgecolor='black')
+    plt.xlabel('Confidence')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
 
     plt.subplot(1, 2, 1)
     plt.title('YOLOv8 Detections and Path')

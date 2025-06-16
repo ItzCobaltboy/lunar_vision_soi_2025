@@ -12,6 +12,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from sklearn.cluster import KMeans
 from torchvision.ops import nms
+from torch.cuda.amp import GradScaler, autocast
+
 
 
 # This is our custom model for crater detection built from scratch. inspired by YOLO architecture. Builds on with our custom features
@@ -45,8 +47,20 @@ lambda_coord = 2.0
 lambda_noobj = 4.0
 lambda_obj = 4.0
 
+def get_current_img_size(epoch, total_epochs):
+    """Progressively increase image size during training."""
+    if epoch < total_epochs * 0.3:
+        return 224
+    elif epoch < total_epochs * 0.6:
+        return 320
+    else:
+        return 416
+
+
 ################# Main functon at final execution point #################
 def main():
+    scaler = GradScaler()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
@@ -89,14 +103,23 @@ def main():
     print("\n=== STARTING TRAINING ===")
     for epoch in range(EPOCHS):
         print(f"\n--- EPOCH {epoch+1}/{EPOCHS} ---")
-        
+    
+        # Progressive Image Resizing
+        current_img_size = get_current_img_size(epoch, EPOCHS)
+
+        # Dynamically create train dataset and loader with new image size
+        train_dataset = CraterDataset(TRAIN_IMG_DIR, TRAIN_LABEL_DIR, augment=True, current_img_size=current_img_size)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+                              collate_fn=collate_fn, num_workers=2, pin_memory=True)
+
         # Training
-        train_loss, obj_loss, noobj_loss, bbox_loss = train_one_epoch(
-            model, train_loader, optimizer, device, ANCHORS, epoch)
-        
-        # Validation
+        train_loss, obj_loss, noobj_loss, bbox_loss = train_one_epoch_amp(
+        model, train_loader, optimizer, device, ANCHORS, epoch)
+
+        # Validation (can keep validation dataset fixed or optionally update its size here)
         val_loss = validate_one_epoch(model, valid_loader, device, ANCHORS)
-        
+
+
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -187,12 +210,13 @@ class KMeansAnchorGenerator:
         
 # === DATASET ===
 class CraterDataset(Dataset):
-    def __init__(self, image_dir, label_dir, transform=None, augment=False):
+    def __init__(self, image_dir, label_dir, transform=None, augment=False, current_img_size=416):
         self.image_dir = image_dir
         self.label_dir = label_dir
         self.image_files = sorted(os.listdir(image_dir))
         self.transform = transform
         self.augment = augment
+        self.current_img_size = current_img_size
 
     def __len__(self):
         return len(self.image_files)
@@ -201,7 +225,7 @@ class CraterDataset(Dataset):
         img_filename = self.image_files[idx]
         img_path = os.path.join(self.image_dir, img_filename)
         image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        image = cv2.resize(image, (IMG_SIZE, IMG_SIZE))
+        image = cv2.resize(image, (self.current_img_size, self.current_img_size))
         
         # Simple augmentation
         if self.augment and random.random() > 0.5:
@@ -578,7 +602,62 @@ def calculate_iou(box1, box2):
 
 
 # === TRAINING FUNCTIONS ===
-def train_one_epoch(model, dataloader, optimizer, device, anchors, epoch):
+
+from torch.cuda.amp import GradScaler, autocast
+
+scaler = GradScaler()
+
+def train_one_epoch_amp(model, dataloader, optimizer, device, anchors, epoch):
+    model.train()
+    total_loss = 0
+    total_obj_loss = 0
+    total_noobj_loss = 0
+    total_bbox_loss = 0
+
+    pbar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}")
+
+    for batch_idx, (imgs, targets) in enumerate(pbar):
+        imgs = imgs.to(device)
+        targets = [t.to(device) for t in targets]
+
+        optimizer.zero_grad()
+
+        with autocast():
+            preds = model(imgs)
+            grid_size = preds.shape[2]
+            loss, obj_loss, noobj_loss, bbox_loss = improved_yolo_loss(preds, targets, anchors, grid_size)
+
+        if torch.isnan(loss):
+            print("❌ NaN loss detected, skipping batch")
+            continue
+
+        scaler.scale(loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        total_obj_loss += obj_loss.item() if isinstance(obj_loss, torch.Tensor) else obj_loss
+        total_noobj_loss += noobj_loss.item() if isinstance(noobj_loss, torch.Tensor) else noobj_loss
+        total_bbox_loss += bbox_loss.item() if isinstance(bbox_loss, torch.Tensor) else bbox_loss
+
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'obj': f'{obj_loss.item() if isinstance(obj_loss, torch.Tensor) else obj_loss:.4f}',
+            'bbox': f'{bbox_loss.item() if isinstance(bbox_loss, torch.Tensor) else bbox_loss:.4f}'
+        })
+
+        if batch_idx == 0:
+            decoded_preds = [decode_predictions(preds[i].unsqueeze(0), anchors) for i in range(len(imgs))]
+            visualize_predictions(imgs.cpu(), decoded_preds, targets, epoch=epoch)
+
+    return (total_loss / len(dataloader),
+            total_obj_loss / len(dataloader),
+            total_noobj_loss / len(dataloader),
+            total_bbox_loss / len(dataloader))
+
+
+"""def train_one_epoch(model, dataloader, optimizer, device, anchors, epoch):
     model.train()
     total_loss = 0
     total_obj_loss = 0
@@ -603,12 +682,20 @@ def train_one_epoch(model, dataloader, optimizer, device, anchors, epoch):
             print("❌ NaN loss detected, skipping batch")
             continue
         
-        loss.backward()
-        
-        # Gradient clipping
+        with autocast():
+            preds = model(imgs)
+            grid_size = preds.shape[2]
+            loss, obj_loss, noobj_loss, bbox_loss = improved_yolo_loss(preds, targets, anchors, grid_size)
+
+        if torch.isnan(loss):
+            print("❌ NaN loss detected, skipping batch")
+            continue
+
+        scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+
         
         total_loss += loss.item()
         total_obj_loss += obj_loss.item() if isinstance(obj_loss, torch.Tensor) else obj_loss
@@ -630,6 +717,7 @@ def train_one_epoch(model, dataloader, optimizer, device, anchors, epoch):
             total_obj_loss / len(dataloader),
             total_noobj_loss / len(dataloader), 
             total_bbox_loss / len(dataloader))
+"""
 
 @torch.no_grad()
 def validate_one_epoch(model, dataloader, device, anchors):
