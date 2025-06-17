@@ -139,6 +139,3 @@ def web_interface():
 
 if __name__ == "__main__":
     web_interface()
-
-# Note: Grad-CAM functionality is simulated due to environment restrictions.
-# This Streamlit web interface version includes edge-aware preprocessing, hazard scoring, simulated depth estimation, simulated explainability integration, and a simple rover path planning algorithm.

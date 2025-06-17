@@ -7,14 +7,14 @@ import os
 
 def main():
     # Get absolute path to the Dataset folder
-    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "Dataset_sampled")) # Adjust this path as needed
+    # Adjust this path as needed
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "Dataset_sampled")) 
 
     # Escape backslashes or use raw strings for Windows paths in YAML
     train_path = BASE_DIR.replace("\\", "/") + "/train/images"
     val_path = BASE_DIR.replace("\\", "/") + "/valid/images"
-
-
     save_path = os.path.join(BASE_DIR, "yolo_model.pt")
+
     # Build YAML content
     yaml_content = f"""
 train: {train_path}
@@ -43,8 +43,8 @@ names: ['crater']
     results = model.train(
         data='simple_yolo_data.yaml',
         imgsz=416,              # Matches dataset, no resizing
-        epochs=100,
-        batch=-1,                
+        epochs=100,             # epochs
+        batch=-1,               # auto batch size
         device=0,
         workers=3,
         patience=20,
@@ -68,8 +68,8 @@ names: ['crater']
         mixup=0.2,
         close_mosaic=10
     )
-    # Display training results summary
 
+    # Display training results summary
     model.save(save_path)
 
     print(results)

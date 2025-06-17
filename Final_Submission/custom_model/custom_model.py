@@ -656,69 +656,6 @@ def train_one_epoch_amp(model, dataloader, optimizer, device, anchors, epoch):
             total_noobj_loss / len(dataloader),
             total_bbox_loss / len(dataloader))
 
-
-"""def train_one_epoch(model, dataloader, optimizer, device, anchors, epoch):
-    model.train()
-    total_loss = 0
-    total_obj_loss = 0
-    total_noobj_loss = 0
-    total_bbox_loss = 0
-    
-    pbar = tqdm(dataloader, desc=f"Training Epoch {epoch+1}")
-    
-    for batch_idx, (imgs, targets) in enumerate(pbar):
-        imgs = imgs.to(device)
-        targets = [t.to(device) for t in targets]
-        
-        optimizer.zero_grad()
-        preds = model(imgs)
-        
-        # Calculate grid size from predictions
-        grid_size = preds.shape[2]  # Assuming square grid
-        
-        loss, obj_loss, noobj_loss, bbox_loss = improved_yolo_loss(preds, targets, anchors, grid_size)
-        
-        if torch.isnan(loss):
-            print("❌ NaN loss detected, skipping batch")
-            continue
-        
-        with autocast():
-            preds = model(imgs)
-            grid_size = preds.shape[2]
-            loss, obj_loss, noobj_loss, bbox_loss = improved_yolo_loss(preds, targets, anchors, grid_size)
-
-        if torch.isnan(loss):
-            print("❌ NaN loss detected, skipping batch")
-            continue
-
-        scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-
-        
-        total_loss += loss.item()
-        total_obj_loss += obj_loss.item() if isinstance(obj_loss, torch.Tensor) else obj_loss
-        total_noobj_loss += noobj_loss.item() if isinstance(noobj_loss, torch.Tensor) else noobj_loss
-        total_bbox_loss += bbox_loss.item() if isinstance(bbox_loss, torch.Tensor) else bbox_loss
-        
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'obj': f'{obj_loss.item() if isinstance(obj_loss, torch.Tensor) else obj_loss:.4f}',
-            'bbox': f'{bbox_loss.item() if isinstance(bbox_loss, torch.Tensor) else bbox_loss:.4f}'
-        })
-        
-        if batch_idx == 0:
-            decoded_preds = [decode_predictions(preds[i].unsqueeze(0), anchors) for i in range(len(imgs))]
-            visualize_predictions(imgs.cpu(), decoded_preds, targets, epoch=epoch)
-
-        
-    return (total_loss / len(dataloader), 
-            total_obj_loss / len(dataloader),
-            total_noobj_loss / len(dataloader), 
-            total_bbox_loss / len(dataloader))
-"""
-
 @torch.no_grad()
 def validate_one_epoch(model, dataloader, device, anchors):
     model.eval()

@@ -7,9 +7,9 @@ import torch
 
 # === CONFIG ===
 BASE_DIR = os.path.dirname(__file__)
-MODEL_PATH = os.path.join(BASE_DIR, 'yolo_weights.pt')         # Trained model path
-TEST_IMAGES_DIR = os.path.join(BASE_DIR, "images")        # Folder with test images
-OUTPUT_LABELS_DIR = os.path.join(BASE_DIR, "labels")           # Folder where txts will be saved
+MODEL_PATH = os.path.join(BASE_DIR, 'yolo_weights.pt')          # Trained model path
+TEST_IMAGES_DIR = os.path.join(BASE_DIR, "images")              # Folder with test images
+OUTPUT_LABELS_DIR = os.path.join(BASE_DIR, "labels")            # Folder where txts will be saved
 
 # === SETUP ===
 os.makedirs(OUTPUT_LABELS_DIR, exist_ok=True)
@@ -20,7 +20,7 @@ print("CUDA available:", torch.cuda.is_available())
 print("Using device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
 # === INFER AND SAVE LABELS ===
-image_files = list(Path(TEST_IMAGES_DIR).glob("*.jpg"))  # Add more extensions if needed
+image_files = list(Path(TEST_IMAGES_DIR).glob("*.jpg"))         # Add more extensions if needed
 
 if not image_files:
     print("⚠️  No .jpg images found in", TEST_IMAGES_DIR)
