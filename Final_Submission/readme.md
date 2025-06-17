@@ -28,6 +28,7 @@ The goal? Find **craters**. Only craters. Moon's pretty chill like that.
 │   ├── Simple_YOLO.py        ← Inference script to generate YOLO-style .txt labels
 │   ├── dataset_evaluator.py  ← Training script (if you feel like retraining)
 │   ├── webinterface.py       ← ⚡ Streamlit app for YOLO inference
+│   ├── terrain_analysis.py   ← Script for hazard/pathfinding/edge depth analysis
 │   └── labels.zip            ← Our YOLO model's output on test set
 ├── custom_model/             ← Our handcrafted YOLO-style model
 │   └── custom_model.py       ← Model code + custom loss function
@@ -57,7 +58,7 @@ python dataset_evaluator.py
 Make sure you’ve got your test images ready — `.txt` labels will be saved in `labels/`.
 
 
-To run the web app:
+BONUS: To run the web app:
 ```bash
 cd yolo_model
 streamlit webinterface.py
@@ -80,6 +81,46 @@ BUT — we didn’t train it all the way. It needs **800–1000 epochs** to conv
 
 ---
 
+## 🌌 BONUS: Terrain Analysis Add-On (`terrain_analysis.py`)
+
+We added a CLI-based utility for **lunar terrain assessment** using the trained YOLOv8 model — it's called `terrain_analysis.py`.
+
+### 🛠️ What It Does
+
+This script goes beyond detection. Here's what it brings to the Moon table:
+
+- ✅ **YOLOv8-based crater detection**  
+- 🌐 **Edge-aware image preprocessing** (via Canny + blending)
+- ⚠️ **Hazard Map Generation**  
+  Craters increase hazard score + refined using edge intensity
+- 🌊 **Simulated Depth Estimation**  
+  Based on edge presence and Gaussian smoothing
+- 🚗 **A\* Pathfinding Algorithm**  
+  For identifying a safe rover path across the image, from top-left to bottom-right
+
+> 📈 Visual output: Detections, Hazard Map, Depth Map — all side-by-side in a Matplotlib window.
+
+### ▶️ How to Run
+
+```bash
+cd yolo_model
+python terrain_analysis.py
+```
+
+When prompted:
+
+```
+Enter the path to the lunar image: path/to/your/test_image.png
+```
+
+You’ll get:
+
+- YOLOv8 detection result overlaid on the image
+- Hazard heatmap (red = dangerous)
+- Simulated depth estimation
+- A safe path plotted in green
+
+---
 ## 📄 Report?
 
 Yep. There’s a `report.pdf` in the root if you want the formal-ish side of this thing.  
