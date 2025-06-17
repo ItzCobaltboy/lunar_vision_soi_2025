@@ -39,5 +39,5 @@ def sample_dataset(split, sample_size):
 
 
 # === CONFIG ===
-sample_dataset("train", sample_size=300)
-sample_dataset("valid", sample_size=200)
+sample_dataset("train", sample_size=3000)
+sample_dataset("valid", sample_size=2000)

@@ -155,5 +155,3 @@ if __name__ == "__main__":
     image_path = input("Enter the path to the lunar image: ")
     detect_with_cam(image_path)
 
-# Note: Grad-CAM and Gradio functionality are removed due to environment restrictions (missing torch and ssl modules).
-# This CLI-based version now includes edge-aware preprocessing, hazard scoring, simulated depth estimation, and a simple rover path planning algorithm to demonstrate multi-task learning simulation.
