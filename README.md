@@ -63,7 +63,7 @@ Make sure you’ve got your test images ready — `.txt` labels will be saved in
 BONUS: To run the web app:
 ```bash
 cd yolo_model
-streamlit webinterface.py
+streamlit run webinterface.py
 ```
 ---
 
