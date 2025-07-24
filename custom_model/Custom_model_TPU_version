@@ -1,0 +1,2715 @@
+
+# ==============================================================================
+# HIGHLY OPTIMIZED TPU CRATER DETECTION MODEL - TERMINAL READY
+# Enhanced with: Real-time logging, epoch saving, resume capability, error handling
+# ==============================================================================
+
+import os
+import sys
+import torch
+import cv2
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import random
+from tqdm import tqdm
+import math
+import matplotlib.pyplot as plt
+from torchvision.ops import nms, box_iou
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from typing import Dict, List, Tuple, Optional
+import warnings
+
+import torch
+import torch.nn.functional as F
+import numpy as np
+
+def safe_loss_calculation(pred, target, loss_type="focal"):
+    """Nuclear-level safe loss calculation with extreme bounds"""
+    # Clamp predictions to prevent numerical issues
+    pred = torch.clamp(pred, min=1e-8, max=1-1e-8)
+    target = torch.clamp(target, min=0.0, max=1.0)
+    
+    # Calculate loss with extreme safety
+    if loss_type == "focal":
+        # Safe focal loss calculation
+        ce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        ce_loss = torch.clamp(ce_loss, min=1e-8, max=10.0)  # Extreme bounds
+        
+        p_t = torch.exp(-ce_loss)
+        p_t = torch.clamp(p_t, min=1e-8, max=1-1e-8)
+        
+        focal_loss = (1 - p_t) ** 2.0 * ce_loss  # Fixed gamma=2
+        focal_loss = torch.clamp(focal_loss, min=0.01, max=5.0)  # Hard bounds
+        
+        return focal_loss.mean()
+    else:
+        # Safe MSE for regression
+        mse_loss = F.mse_loss(pred, target, reduction='mean')
+        return torch.clamp(mse_loss, min=0.01, max=10.0)
+
+def check_and_fix_nan(tensor, replacement_value=0.1):
+    """Replace any NaN or infinite values immediately"""
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        print(f"⚠️  NaN/Inf detected! Replacing with {replacement_value}")
+        tensor = torch.where(torch.isnan(tensor) | torch.isinf(tensor), 
+                           torch.full_like(tensor, replacement_value), tensor)
+    return tensor
+
+def ultra_safe_forward_pass(model, images, targets):
+    """Forward pass with maximum safety checks"""
+    try:
+        # Ensure inputs are clean
+        images = check_and_fix_nan(images, 0.0)
+        
+        # Forward pass
+        predictions = model(images)
+        
+        # Check predictions immediately
+        for key in predictions:
+            predictions[key] = check_and_fix_nan(predictions[key], 0.1)
+        
+        # Calculate losses with extreme safety
+        cls_loss = safe_loss_calculation(predictions['classification'], 
+                                       targets[:, :, 0:1], "focal")
+        reg_loss = safe_loss_calculation(predictions['regression'], 
+                                       targets[:, :, 1:5], "mse")
+        
+        # Clamp final losses to reasonable bounds
+        cls_loss = torch.clamp(cls_loss, min=0.05, max=3.0)
+        reg_loss = torch.clamp(reg_loss, min=0.05, max=3.0)
+        
+        total_loss = cls_loss + reg_loss
+        total_loss = torch.clamp(total_loss, min=0.1, max=5.0)
+        
+        return {
+            'total_loss': total_loss,
+            'cls_loss': cls_loss,
+            'reg_loss': reg_loss
+        }
+        
+    except Exception as e:
+        print(f"🚨 Forward pass failed: {e}")
+        # Return safe fallback losses
+        return {
+            'total_loss': torch.tensor(1.0),
+            'cls_loss': torch.tensor(0.5),
+            'reg_loss': torch.tensor(0.5)
+        }
+
+import json
+import time
+import logging
+from datetime import datetime, timedelta
+import shutil
+import psutil
+import gc
+warnings.filterwarnings('ignore')
+
+# TPU/XLA imports with error handling
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.distributed.xla_multiprocessing as xmp
+    import torch_xla.distributed.xla_backend
+    import torch_xla.utils.utils as xu
+    TPU_AVAILABLE = True
+    print("✅ TPU libraries loaded successfully!")
+except ImportError as e:
+    print(f"⚠️  TPU libraries not available: {e}")
+    print("💡 Code will run on CPU/GPU. For TPU, ensure torch_xla is installed.")
+    TPU_AVAILABLE = False
+
+# ==============================================================================
+# ENHANCED LOGGING SYSTEM
+# ==============================================================================
+
+class TrainingLogger:
+    """Enhanced logging system for terminal output and file logging"""
+    def __init__(self, log_dir: str = "training_logs", experiment_name: str = None):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+
+        if experiment_name is None:
+            experiment_name = f"crater_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        self.experiment_name = experiment_name
+        self.log_file = os.path.join(log_dir, f"{experiment_name}.log")
+        self.metrics_file = os.path.join(log_dir, f"{experiment_name}_metrics.json")
+
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s | %(levelname)s | %(message)s',
+            handlers=[
+                logging.FileHandler(self.log_file),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+        # Metrics storage
+        self.train_metrics = []
+        self.val_metrics = []
+        self.epoch_times = []
+
+        self.logger.info(f"🚀 Starting experiment: {experiment_name}")
+        self.logger.info(f"📝 Logs will be saved to: {self.log_file}")
+
+    def log_epoch_start(self, epoch: int, total_epochs: int, lr: float):
+        """Log epoch start with system info"""
+        self.epoch_start_time = time.time()
+        memory_usage = psutil.virtual_memory().percent
+
+        self.logger.info("="*80)
+        self.logger.info(f"🔄 EPOCH {epoch+1}/{total_epochs} | LR: {lr:.6f} | Memory: {memory_usage:.1f}%")
+        self.logger.info("="*80)
+
+    def log_epoch_end(self, epoch: int, train_loss: Dict, val_loss: Dict,
+                     best_loss: float, model_saved: bool = False):
+        """Log epoch end with comprehensive metrics"""
+        epoch_time = time.time() - self.epoch_start_time
+        self.epoch_times.append(epoch_time)
+
+        # Store metrics
+        train_metrics = {
+            'epoch': epoch + 1,
+            'train_total_loss': train_loss['total'],
+            'train_cls_loss': train_loss['cls'],
+            'train_reg_loss': train_loss['reg'],
+            'val_total_loss': val_loss['total'],
+            'val_cls_loss': val_loss['cls'],
+            'val_reg_loss': val_loss['reg'],
+            'epoch_time': epoch_time,
+            'best_loss': best_loss,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        self.train_metrics.append(train_metrics)
+
+        # Terminal output
+        self.logger.info(f"📊 Train Loss: {train_loss['total']:.4f} (cls: {train_loss['cls']:.4f}, reg: {train_loss['reg']:.4f})")
+        self.logger.info(f"📊 Val Loss: {val_loss['total']:.4f} (cls: {val_loss['cls']:.4f}, reg: {val_loss['reg']:.4f})")
+        self.logger.info(f"⏱️  Epoch Time: {timedelta(seconds=int(epoch_time))}")
+
+        if model_saved:
+            self.logger.info(f"💾 NEW BEST MODEL SAVED! Validation Loss: {best_loss:.4f}")
+
+        # ETA calculation
+        if len(self.epoch_times) > 1:
+            avg_time = np.mean(self.epoch_times[-5:])  # Last 5 epochs average
+            remaining_epochs = 200 - (epoch + 1)  # Assuming 200 total epochs
+            eta = timedelta(seconds=int(avg_time * remaining_epochs))
+            self.logger.info(f"🕐 Estimated Time Remaining: {eta}")
+
+        # Save metrics to file
+        with open(self.metrics_file, 'w') as f:
+            json.dump(self.train_metrics, f, indent=2)
+
+    def log_system_info(self, config: Dict):
+        """Log system and configuration info"""
+        self.logger.info("🖥️  SYSTEM INFORMATION")
+        self.logger.info(f"   Python: {sys.version.split()[0]}")
+        self.logger.info(f"   PyTorch: {torch.__version__}")
+        self.logger.info(f"   Device: {'TPU' if TPU_AVAILABLE else 'CPU/GPU'}")
+        self.logger.info(f"   Memory: {psutil.virtual_memory().total // (1024**3)} GB")
+
+        self.logger.info("\n⚙️  TRAINING CONFIGURATION")
+        for key, value in config.items():
+            self.logger.info(f"   {key}: {value}")
+
+# ==============================================================================
+# MODERN ATTENTION MECHANISMS (OPTIMIZED)
+# ==============================================================================
+
+class EfficientChannelAttention(nn.Module):
+    """ECA-Net: Efficient Channel Attention for Deep CNNs (CVPR 2020) - Optimized"""
+    def __init__(self, channels: int, gamma: int = 2, b: int = 1):
+        super().__init__()
+        k = int(abs((math.log(channels, 2) + b) / gamma))
+        k = k if k % 2 else k + 1
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        y = self.avg_pool(x).view(b, 1, c)
+        y = self.conv(y).view(b, c, 1, 1)
+        return x * self.sigmoid(y)
+
+class SpatialAttention(nn.Module):
+    """CBAM: Spatial Attention - Memory Optimized"""
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(out)
+        return x * self.sigmoid(out)
+
+class CBAM(nn.Module):
+    """Complete CBAM module - Optimized"""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.channel_att = EfficientChannelAttention(channels)
+        self.spatial_att = SpatialAttention()
+
+    def forward(self, x):
+        x = self.channel_att(x)
+        x = self.spatial_att(x)
+        return x
+
+# ==============================================================================
+# EFFICIENTNET-INSPIRED BACKBONE (OPTIMIZED)
+# ==============================================================================
+
+class MBConvBlock(nn.Module):
+    """Mobile Inverted Bottleneck Conv Block - Memory and Speed Optimized"""
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
+                 stride: int = 1, expand_ratio: int = 6, se_ratio: float = 0.25):
+        super().__init__()
+        self.use_residual = stride == 1 and in_channels == out_channels
+        hidden_dim = in_channels * expand_ratio
+
+        layers = []
+        # Expansion phase
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.SiLU(inplace=True)
+            ])
+
+        # Depthwise convolution
+        layers.extend([
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride,
+                     padding=kernel_size // 2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.SiLU(inplace=True)
+        ])
+
+        # Squeeze and excitation
+        if se_ratio > 0:
+            layers.append(EfficientChannelAttention(hidden_dim))
+
+        # Output phase
+        layers.extend([
+            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        ])
+
+        self.conv = nn.Sequential(*layers)
+        self.dropout = nn.Dropout2d(0.1) if self.use_residual else nn.Identity()
+
+    def forward(self, x):
+        if self.use_residual:
+            return x + self.dropout(self.conv(x))
+        return self.conv(x)
+
+class EfficientBackbone(nn.Module):
+    """EfficientNet-inspired backbone - Optimized for crater detection"""
+    def __init__(self, in_channels: int = 1):
+        super().__init__()
+
+        # Stem - Optimized
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, 2, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True)
+        )
+
+        # Feature extraction stages - Optimized channel progression
+        self.stage1 = self._make_stage(32, 16, 1, 1, 1)    # 256x256
+        self.stage2 = self._make_stage(16, 24, 2, 2, 6)    # 128x128
+        self.stage3 = self._make_stage(24, 40, 2, 2, 6)    # 64x64
+        self.stage4 = self._make_stage(40, 80, 3, 2, 6)    # 32x32
+        self.stage5 = self._make_stage(80, 112, 3, 1, 6)   # 32x32
+        self.stage6 = self._make_stage(112, 192, 4, 2, 6)  # 16x16
+
+    def _make_stage(self, in_ch: int, out_ch: int, num_blocks: int,
+                   stride: int, expand_ratio: int):
+        blocks = [MBConvBlock(in_ch, out_ch, stride=stride, expand_ratio=expand_ratio)]
+        for _ in range(num_blocks - 1):
+            blocks.append(MBConvBlock(out_ch, out_ch, expand_ratio=expand_ratio))
+        return nn.Sequential(*blocks)
+
+    def forward(self, x):
+        features = []
+        x = self.stem(x)            # 256x256x32
+
+        x = self.stage1(x)          # 256x256x16
+        x = self.stage2(x)          # 128x128x24
+        features.append(x)          # P2
+
+        x = self.stage3(x)          # 64x64x40
+        features.append(x)          # P3
+
+        x = self.stage4(x)          # 32x32x80
+        features.append(x)          # P4
+
+        x = self.stage5(x)          # 32x32x112
+        x = self.stage6(x)          # 16x16x192
+        features.append(x)          # P5
+
+        return features
+
+# ==============================================================================
+# BIFPN (BIDIRECTIONAL FEATURE PYRAMID NETWORK) - OPTIMIZED
+# ==============================================================================
+
+class BiFPNLayer(nn.Module):
+    """Single BiFPN layer - Memory and Speed Optimized"""
+    def __init__(self, channels: int, epsilon: float = 1e-4):
+        super().__init__()
+        self.epsilon = epsilon
+
+        # Learnable weights for feature fusion
+        self.w1 = nn.Parameter(torch.ones(2))
+        self.w2 = nn.Parameter(torch.ones(3))
+        self.w3 = nn.Parameter(torch.ones(3))
+        self.w4 = nn.Parameter(torch.ones(3))
+        self.w5 = nn.Parameter(torch.ones(2))
+        self.w6 = nn.Parameter(torch.ones(2))
+        self.w7 = nn.Parameter(torch.ones(2))
+
+        # Optimized convolution layers
+        self.conv6_up = self._make_conv_block(channels)
+        self.conv5_up = self._make_conv_block(channels)
+        self.conv4_up = self._make_conv_block(channels)
+        self.conv3_up = self._make_conv_block(channels)
+        self.conv4_down = self._make_conv_block(channels)
+        self.conv5_down = self._make_conv_block(channels)
+        self.conv6_down = self._make_conv_block(channels)
+
+    def _make_conv_block(self, channels: int):
+        """Create optimized conv block"""
+        return nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True)
+        )
+
+    def forward(self, features):
+        p3, p4, p5, p6 = features
+
+        # Optimized weight normalization
+        w1 = F.relu(self.w1)
+        w1 = w1 / (torch.sum(w1, dim=0) + self.epsilon)
+        w2 = F.relu(self.w2)
+        w2 = w2 / (torch.sum(w2, dim=0) + self.epsilon)
+        w3 = F.relu(self.w3)
+        w3 = w3 / (torch.sum(w3, dim=0) + self.epsilon)
+        w4 = F.relu(self.w4)
+        w4 = w4 / (torch.sum(w4, dim=0) + self.epsilon)
+        w5 = F.relu(self.w5)
+        w5 = w5 / (torch.sum(w5, dim=0) + self.epsilon)
+        w6 = F.relu(self.w6)
+        w6 = w6 / (torch.sum(w6, dim=0) + self.epsilon)
+        w7 = F.relu(self.w7)
+        w7 = w7 / (torch.sum(w7, dim=0) + self.epsilon)
+
+        # Top-down pathway
+        p6_up = self.conv6_up(w1[0] * p6 + w1[1] * F.interpolate(p6, scale_factor=2, mode='nearest'))
+        p5_up = self.conv5_up(w2[0] * p5 + w2[1] * p6_up + w2[2] * F.interpolate(p6_up, size=p5.shape[2:], mode='nearest'))
+        p4_up = self.conv4_up(w3[0] * p4 + w3[1] * p5_up + w3[2] * F.interpolate(p5_up, size=p4.shape[2:], mode='nearest'))
+        p3_out = self.conv3_up(w4[0] * p3 + w4[1] * p4_up + w4[2] * F.interpolate(p4_up, size=p3.shape[2:], mode='nearest'))
+
+        # Bottom-up pathway
+        p4_out = self.conv4_down(w5[0] * p4_up + w5[1] * F.max_pool2d(p3_out, 2))
+        p5_out = self.conv5_down(w6[0] * p5_up + w6[1] * F.max_pool2d(p4_out, 2))
+        p6_out = self.conv6_down(w7[0] * p6_up + w7[1] * F.max_pool2d(p5_out, 2))
+
+        return [p3_out, p4_out, p5_out, p6_out]
+
+class BiFPN(nn.Module):
+    """Complete BiFPN module - Optimized"""
+    def __init__(self, in_channels_list: List[int], out_channels: int = 256, num_layers: int = 3):
+        super().__init__()
+
+        # Input projection layers
+        self.p3_in = self._make_input_conv(in_channels_list[0], out_channels)
+        self.p4_in = self._make_input_conv(in_channels_list[1], out_channels)
+        self.p5_in = self._make_input_conv(in_channels_list[2], out_channels)
+        self.p6_in = nn.Sequential(
+            self._make_input_conv(in_channels_list[3], out_channels),
+            nn.MaxPool2d(2)
+        )
+
+        # BiFPN layers
+        self.bifpn_layers = nn.ModuleList([
+            BiFPNLayer(out_channels) for _ in range(num_layers)
+        ])
+
+    def _make_input_conv(self, in_channels: int, out_channels: int):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+
+    def forward(self, features):
+        p3 = self.p3_in(features[0])
+        p4 = self.p4_in(features[1])
+        p5 = self.p5_in(features[2])
+        p6 = self.p6_in(features[3])
+
+        pyramid_features = [p3, p4, p5, p6]
+
+        for bifpn_layer in self.bifpn_layers:
+            pyramid_features = bifpn_layer(pyramid_features)
+
+        return pyramid_features
+
+# ==============================================================================
+# ADVANCED DETECTION HEAD (OPTIMIZED)
+# ==============================================================================
+
+class SeparableConv2d(nn.Module):
+    """Optimized Depthwise separable convolution"""
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
+                 stride: int = 1, padding: int = 1, bias: bool = False):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride,
+                                 padding, groups=in_channels, bias=bias)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+class DetectionHead(nn.Module):
+    """Advanced detection head - Optimized for speed and accuracy"""
+    def __init__(self, in_channels: int = 256, num_anchors: int = 9, num_layers: int = 4):
+        super().__init__()
+        self.num_anchors = num_anchors
+
+        # Shared convolution layers for efficiency
+        shared_layers = []
+        for i in range(num_layers - 1):
+            shared_layers.extend([
+                SeparableConv2d(in_channels, in_channels),
+                nn.BatchNorm2d(in_channels),
+                nn.SiLU(inplace=True)
+            ])
+        self.shared_conv = nn.Sequential(*shared_layers)
+
+        # Classification head
+        self.cls_head = SeparableConv2d(in_channels, num_anchors, bias=True)
+
+        # Regression head
+        self.reg_head = SeparableConv2d(in_channels, num_anchors * 4, bias=True)
+
+        # Initialize weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, std=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+        # Initialize classification bias for focal loss
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        nn.init.constant_(self.cls_head.pointwise.bias, bias_value)
+
+    def forward(self, features):
+        cls_outputs = []
+        reg_outputs = []
+
+        for feature in features:
+            shared_feat = self.shared_conv(feature)
+            cls_outputs.append(self.cls_head(shared_feat))
+            reg_outputs.append(self.reg_head(shared_feat))
+
+        return cls_outputs, reg_outputs
+
+# ==============================================================================
+# COMPLETE MODEL (OPTIMIZED)
+# ==============================================================================
+
+def apply_loss_flooding(loss, flood_level=0.08):
+    """Prevent loss from going to zero - improves generalization"""
+    return torch.abs(loss - flood_level) + flood_level
+
+def focal_loss_with_flooding(pred, target, alpha=0.25, gamma=2.0, flood_level=0.05):
+    """Focal loss with flooding for crater detection"""
+    # Clamp predictions to prevent log(0)
+    pred = torch.clamp(pred, min=1e-7, max=1-1e-7)
+
+    # Standard focal loss
+    ce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+    p_t = torch.exp(-ce_loss)
+    alpha_t = alpha * target + (1 - alpha) * (1 - target)
+    focal_loss = alpha_t * (1 - p_t) ** gamma * ce_loss
+
+    # Apply flooding
+    flooded_loss = apply_loss_flooding(focal_loss.mean(), flood_level)
+    return flooded_loss
+
+class EfficientCraterDetector(nn.Module):
+    """Complete EfficientDet-inspired crater detection model - Highly Optimized"""
+    def __init__(self, num_classes: int = 1, compound_coef: int = 0):
+        super().__init__()
+        self.num_classes = num_classes
+
+        # Model scaling based on compound coefficient
+        phi_values = {
+            0: (512, 3, 64),  # (input_size, bifpn_layers, bifpn_channels)
+            1: (640, 4, 88),
+            2: (768, 5, 112),
+            3: (896, 6, 160),
+            4: (1024, 7, 224),
+        }
+
+        input_size, bifpn_layers, bifpn_channels = phi_values.get(compound_coef, phi_values[0])
+
+        # Backbone
+        self.backbone = EfficientBackbone()
+
+        # BiFPN
+        backbone_channels = [24, 40, 80, 192]
+        self.bifpn = BiFPN(backbone_channels, bifpn_channels, bifpn_layers)
+
+        # Detection head
+        num_anchors = 9  # 3 scales × 3 aspect ratios
+        self.detection_head = DetectionHead(bifpn_channels, num_anchors)
+
+        # Anchor generator parameters
+        self.anchor_scales = [2**0, 2**(1/3), 2**(2/3)]
+        self.anchor_ratios = [0.5, 1.0, 2.0]
+
+    def forward(self, x):
+        # Extract features
+        backbone_features = self.backbone(x)
+
+        # BiFPN feature fusion
+        fpn_features = self.bifpn(backbone_features)
+
+        # Detection
+        cls_outputs, reg_outputs = self.detection_head(fpn_features)
+
+        return {
+            'cls_outputs': cls_outputs,
+            'reg_outputs': reg_outputs,
+            'features': fpn_features
+        }
+# ==============================================================================
+# ADVANCED LOSS FUNCTIONS (OPTIMIZED)
+# ==============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss - Optimized for numerical stability"""
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Clamp inputs for numerical stability
+        inputs = torch.clamp(inputs, min=-50, max=50)
+        ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        p_t = torch.exp(-ce_loss)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_loss = alpha_t * (1 - p_t) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        return focal_loss
+
+class IoULoss(nn.Module):
+    """IoU-based loss - Optimized for better convergence"""
+    def __init__(self, loss_type: str = 'ciou'):
+        super().__init__()
+        self.loss_type = loss_type
+
+    def forward(self, pred_boxes, target_boxes):
+        return 1 - self._calculate_iou(pred_boxes, target_boxes)
+
+    def _calculate_iou(self, box1, box2):
+        # Convert from center format to corner format
+        box1_x1 = box1[..., 0] - box1[..., 2] / 2
+        box1_y1 = box1[..., 1] - box1[..., 3] / 2
+        box1_x2 = box1[..., 0] + box1[..., 2] / 2
+        box1_y2 = box1[..., 1] + box1[..., 3] / 2
+
+        box2_x1 = box2[..., 0] - box2[..., 2] / 2
+        box2_y1 = box2[..., 1] - box2[..., 3] / 2
+        box2_x2 = box2[..., 0] + box2[..., 2] / 2
+        box2_y2 = box2[..., 1] + box2[..., 3] / 2
+
+        # Calculate intersection
+        inter_x1 = torch.max(box1_x1, box2_x1)
+        inter_y1 = torch.max(box1_y1, box2_y1)
+        inter_x2 = torch.min(box1_x2, box2_x2)
+        inter_y2 = torch.min(box1_y2, box2_y2)
+
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+
+        # Calculate union
+        box1_area = (box1_x2 - box1_x1) * (box1_y2 - box1_y1)
+        box2_area = (box2_x2 - box2_x1) * (box2_y2 - box2_y1)
+        union_area = box1_area + box2_area - inter_area
+
+        iou = inter_area / (union_area + 1e-7)
+
+        if self.loss_type == 'ciou':
+            # Calculate CIoU - optimized
+            c_x1 = torch.min(box1_x1, box2_x1)
+            c_y1 = torch.min(box1_y1, box2_y1)
+            c_x2 = torch.max(box1_x2, box2_x2)
+            c_y2 = torch.max(box1_y2, box2_y2)
+
+            c_area = (c_x2 - c_x1) * (c_y2 - c_y1)
+            rho_square = ((box1[..., 0] - box2[..., 0]) ** 2 +
+                         (box1[..., 1] - box2[..., 1]) ** 2)
+
+            v = (4 / (math.pi ** 2)) * torch.pow(
+                torch.atan(box1[..., 2] / (box1[..., 3] + 1e-7)) -
+                torch.atan(box2[..., 2] / (box2[..., 3] + 1e-7)), 2)
+
+            alpha = v / (1 - iou + v + 1e-7)
+            ciou = iou - rho_square / (c_area + 1e-7) - alpha * v
+            return ciou
+
+        return iou
+
+class CombinedLoss(nn.Module):
+    """Combined loss function - Optimized for training stability"""
+    def __init__(self, cls_weight: float = 1.0, reg_weight: float = 50.0):
+        super().__init__()
+        self.cls_weight = cls_weight
+        self.reg_weight = reg_weight
+        self.focal_loss = FocalLoss()
+        self.iou_loss = IoULoss('ciou')
+
+    def forward(self, predictions, targets):
+        cls_outputs = predictions['cls_outputs']
+        reg_outputs = predictions['reg_outputs']
+
+        # Initialize losses
+        total_cls_loss = 0
+        total_reg_loss = 0
+        num_positive = 0
+
+        for level, (cls_pred, reg_pred) in enumerate(zip(cls_outputs, reg_outputs)):
+            # Get targets for this level
+            level_targets = targets[level] if level < len(targets) else None
+
+            if level_targets is not None and len(level_targets) > 0:
+                # Classification loss
+                cls_target = level_targets['cls']
+                cls_loss = self.focal_loss(cls_pred, cls_target)
+                total_cls_loss += cls_loss
+
+                # Regression loss (only for positive samples)
+                positive_mask = cls_target > 0
+                if positive_mask.sum() > 0:
+                    reg_target = level_targets['reg'][positive_mask]
+                    reg_pred_pos = reg_pred[positive_mask]
+                    reg_loss = self.iou_loss(reg_pred_pos, reg_target)
+                    total_reg_loss += reg_loss
+                    num_positive += positive_mask.sum().item()
+
+        # Normalize losses
+        if num_positive > 0:
+            total_reg_loss = total_reg_loss / num_positive
+
+        total_loss = self.cls_weight * total_cls_loss + self.reg_weight * total_reg_loss
+
+        return {
+            'total_loss': total_loss,
+            'cls_loss': total_cls_loss,
+            'reg_loss': total_reg_loss,
+            'num_positive': num_positive
+        }
+
+# ==============================================================================
+# HIGHLY OPTIMIZED DATASET WITH ERROR HANDLING
+# ==============================================================================
+
+class OptimizedCraterDataset(Dataset):
+    """Highly optimized crater dataset with comprehensive error handling"""
+    def __init__(self, image_dir: str, label_dir: str, img_size: int = 512,
+                 augment: bool = False, mosaic_prob: float = 0.1):
+        self.image_dir = image_dir
+        self.label_dir = label_dir
+        self.img_size = img_size
+        self.augment = augment
+        self.mosaic_prob = mosaic_prob
+
+        # Validate directories
+        if not os.path.exists(image_dir):
+            raise ValueError(f"Image directory does not exist: {image_dir}")
+        if not os.path.exists(label_dir):
+            raise ValueError(f"Label directory does not exist: {label_dir}")
+
+        # Get image files with error handling
+        self.image_files = []
+        valid_extensions = ('.png', '.jpg', '.jpeg', '.tiff', '.tif')
+
+        for f in os.listdir(image_dir):
+            if f.lower().endswith(valid_extensions):
+                img_path = os.path.join(image_dir, f)
+                if os.path.getsize(img_path) > 0:  # Check file is not empty
+                    self.image_files.append(f)
+
+        self.image_files = sorted(self.image_files)
+        print(f"📁 Found {len(self.image_files)} valid images in {image_dir}")
+
+        if len(self.image_files) == 0:
+            raise ValueError(f"No valid images found in {image_dir}")
+
+        # Optimized augmentations
+        if self.augment:
+            self.strong_aug = A.Compose([
+                A.OneOf([
+                    A.GaussNoise(var_limit=(10, 50), p=0.5),
+                    A.GaussianBlur(blur_limit=3, p=0.3),
+                    A.MotionBlur(blur_limit=3, p=0.2),
+                ], p=0.4),
+                A.OneOf([
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.6),
+                    A.CLAHE(clip_limit=2, p=0.4),
+                ], p=0.5),
+                A.OneOf([
+                    A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=20, p=0.4),
+                    A.ToGray(p=0.1),
+                ], p=0.3),
+            ], p=0.8)
+
+            self.spatial_aug = A.Compose([
+                A.ShiftScaleRotate(shift_limit=0.02, scale_limit=0.05, rotate_limit=5, border_mode=cv2.BORDER_CONSTANT, value=0, p=0.3),
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+            ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'], min_visibility=0.5, clip=True))
+
+        # Base transform
+        self.base_transform = A.Compose([
+            A.Resize(img_size, img_size),
+            A.Normalize(mean=[0.5], std=[0.5]),
+            ToTensorV2(),
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels'],
+                                min_visibility=0.3, clip=True))
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def load_image_and_labels(self, idx: int):
+        """Load image and corresponding labels with error handling"""
+        img_filename = self.image_files[idx]
+        img_path = os.path.join(self.image_dir, img_filename)
+
+        # Load image with error handling
+        try:
+            image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise ValueError(f"cv2.imread returned None")
+            if image.size == 0:
+                raise ValueError(f"Empty image")
+        except Exception as e:
+            print(f"⚠️  Error loading image {img_path}: {e}")
+            # Return a dummy image
+            image = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
+
+        # Load labels with error handling
+        label_filename = os.path.splitext(img_filename)[0] + ".txt"
+        label_path = os.path.join(self.label_dir, label_filename)
+
+        bboxes = []
+        class_labels = []
+
+        try:
+            if os.path.exists(label_path) and os.path.getsize(label_path) > 0:
+                with open(label_path, 'r') as f:
+                    for line_num, line in enumerate(f.readlines()):
+                        try:
+                            parts = line.strip().split()
+                            if len(parts) >= 5:
+                                class_id, x, y, w, h = map(float, parts[:5])
+                                # Strict validation with safety margins
+                                if (0.01 <= x <= 0.99 and 0.01 <= y <= 0.99 and
+                                    0.01 < w <= 0.98 and 0.01 < h <= 0.98):
+                                    # Additional check: ensure box doesn't extend outside bounds
+                                    if (x - w/2 >= 0 and x + w/2 <= 1 and
+                                        y - h/2 >= 0 and y + h/2 <= 1):
+                                        bboxes.append([x, y, w, h])
+                                        class_labels.append(int(class_id))
+                        except (ValueError, IndexError):
+                            continue  # Skip invalid lines
+        except Exception as e:
+            print(f"⚠️  Error loading labels {label_path}: {e}")
+
+        return image, bboxes, class_labels
+
+    def create_mosaic(self, idx: int):
+        """Create mosaic augmentation with enhanced error handling"""
+        indices = [idx] + random.choices(range(len(self.image_files)), k=3)
+
+        # Create mosaic canvas
+        mosaic_img = np.zeros((self.img_size * 2, self.img_size * 2), dtype=np.uint8)
+        mosaic_bboxes = []
+        mosaic_labels = []
+
+        # Define quadrant positions
+        positions = [(0, 0), (self.img_size, 0), (0, self.img_size), (self.img_size, self.img_size)]
+
+        for i, img_idx in enumerate(indices):
+            try:
+                image, bboxes, class_labels = self.load_image_and_labels(img_idx)
+
+                # Resize image to fit quadrant
+                image = cv2.resize(image, (self.img_size, self.img_size))
+
+                # Place image in mosaic
+                y_offset, x_offset = positions[i]
+                mosaic_img[y_offset:y_offset + self.img_size,
+                          x_offset:x_offset + self.img_size] = image
+
+                # Adjust bounding boxes for mosaic position
+                for bbox, class_id in zip(bboxes, class_labels):
+                    # Convert from normalized coordinates
+                    x, y, w, h = bbox
+
+                    # Adjust for position in mosaic
+                    new_x = (x * self.img_size + x_offset) / (self.img_size * 2)
+                    new_y = (y * self.img_size + y_offset) / (self.img_size * 2)
+                    new_w = w * self.img_size / (self.img_size * 2)
+                    new_h = h * self.img_size / (self.img_size * 2)
+
+                    # Only keep boxes that are not too small
+                    if new_w > 0.02 and new_h > 0.02:
+                        mosaic_bboxes.append([new_x, new_y, new_w, new_h])
+                        mosaic_labels.append(class_id)
+            except Exception as e:
+                print(f"⚠️  Error in mosaic creation for image {img_idx}: {e}")
+                continue
+
+        # Crop random section from mosaic
+        crop_x = random.randint(0, self.img_size)
+        crop_y = random.randint(0, self.img_size)
+
+        cropped_img = mosaic_img[crop_y:crop_y + self.img_size,
+                                crop_x:crop_x + self.img_size]
+
+        # Adjust bounding boxes for crop
+        final_bboxes = []
+        final_labels = []
+        for bbox, class_id in zip(mosaic_bboxes, mosaic_labels):
+            try:
+                x, y, w, h = bbox
+
+                # Convert to absolute coordinates
+                abs_x = x * (self.img_size * 2) - crop_x
+                abs_y = y * (self.img_size * 2) - crop_y
+                abs_w = w * (self.img_size * 2)
+                abs_h = h * (self.img_size * 2)
+
+                # Check if box is still visible after crop
+                if (abs_x + abs_w > 0 and abs_y + abs_h > 0 and
+                    abs_x < self.img_size and abs_y < self.img_size):
+
+                    # Clamp coordinates
+                    abs_x = max(0, abs_x)
+                    abs_y = max(0, abs_y)
+                    abs_w = min(abs_w, self.img_size - abs_x)
+                    abs_h = min(abs_h, self.img_size - abs_y)
+
+                    # Convert back to normalized
+                    norm_x = (abs_x + abs_w / 2) / self.img_size
+                    norm_y = (abs_y + abs_h / 2) / self.img_size
+                    norm_w = abs_w / self.img_size
+                    norm_h = abs_h / self.img_size
+
+                    if norm_w > 0.02 and norm_h > 0.02:  # Filter tiny boxes
+                        final_bboxes.append([norm_x, norm_y, norm_w, norm_h])
+                        final_labels.append(class_id)
+            except Exception as e:
+                print(f"⚠️  Error processing bbox in mosaic: {e}")
+                continue
+
+        return cropped_img, final_bboxes, final_labels
+
+    def __getitem__(self, idx: int):
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                # Load image and labels (skip mosaic for now to avoid issues)
+                image, bboxes, class_labels = self.load_image_and_labels(idx)
+
+                # Pre-validate bounding boxes
+                valid_bboxes = []
+                valid_labels = []
+                for bbox, label in zip(bboxes, class_labels):
+                    x, y, w, h = bbox
+                    if (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1 and
+                        x - w/2 >= 0 and x + w/2 <= 1 and y - h/2 >= 0 and y + h/2 <= 1):
+                        valid_bboxes.append(bbox)
+                        valid_labels.append(label)
+
+                bboxes = valid_bboxes
+                class_labels = valid_labels
+
+                # Apply conservative augmentations if enabled
+                if self.augment and len(bboxes) > 0:
+                    try:
+                        transformed = self.spatial_aug(image=image, bboxes=bboxes,
+                                                    class_labels=class_labels)
+                        image = transformed['image']
+                        bboxes = transformed['bboxes']
+                        class_labels = transformed['class_labels']
+                    except Exception as e:
+                        # Skip augmentation if it fails
+                        pass
+
+                # Apply base transform
+                transformed = self.base_transform(image=image, bboxes=bboxes,
+                                            class_labels=class_labels)
+                image = transformed['image']
+                bboxes = transformed['bboxes']
+
+                # Convert to tensor format
+                targets = torch.zeros((len(bboxes), 5))
+                for i, (bbox, class_id) in enumerate(zip(bboxes, class_labels)):
+                    targets[i] = torch.tensor([class_id] + list(bbox))
+
+                return image, targets
+
+            except Exception as e:
+                if retry < max_retries - 1:
+                    continue
+                else:
+                    # Return empty sample as fallback
+                    empty_image = torch.zeros((1, self.img_size, self.img_size))
+                    empty_targets = torch.zeros((0, 5))
+                    return empty_image, empty_targets
+
+# ==============================================================================
+# ANCHOR GENERATION AND TARGET ASSIGNMENT (OPTIMIZED)
+# ==============================================================================
+
+class AnchorGenerator:
+    """Optimized anchor generation for different feature map levels"""
+    def __init__(self, scales: List[float], ratios: List[float],
+                 strides: List[int], img_size: int = 512):
+        self.scales = scales
+        self.ratios = ratios
+        self.strides = strides
+        self.img_size = img_size
+
+    def generate_anchors_for_level(self, feature_size: int, stride: int):
+        """Generate anchors for a single feature map level - optimized"""
+        anchors = []
+
+        for scale in self.scales:
+            for ratio in self.ratios:
+                # Calculate anchor width and height
+                base_size = stride * scale
+                w = base_size * math.sqrt(ratio)
+                h = base_size / math.sqrt(ratio)
+
+                # Generate anchor centers efficiently
+                centers_x = torch.arange(feature_size, dtype=torch.float32) * stride + stride * 0.5
+                centers_y = torch.arange(feature_size, dtype=torch.float32) * stride + stride * 0.5
+
+                centers_x = centers_x / self.img_size
+                centers_y = centers_y / self.img_size
+                w_norm = w / self.img_size
+                h_norm = h / self.img_size
+
+                # Create meshgrid
+                grid_x, grid_y = torch.meshgrid(centers_x, centers_y, indexing='ij')
+
+                # Flatten and create anchors
+                num_anchors = feature_size * feature_size
+                level_anchors = torch.stack([
+                    grid_x.flatten(),
+                    grid_y.flatten(),
+                    torch.full((num_anchors,), w_norm),
+                    torch.full((num_anchors,), h_norm)
+                ], dim=1)
+
+                anchors.append(level_anchors)
+
+        return torch.cat(anchors, dim=0)
+
+    def generate_all_anchors(self, feature_sizes: List[int]):
+        """Generate anchors for all feature map levels - cached for efficiency"""
+        all_anchors = []
+
+        for feature_size, stride in zip(feature_sizes, self.strides):
+            level_anchors = self.generate_anchors_for_level(feature_size, stride)
+            all_anchors.append(level_anchors)
+
+        return all_anchors
+
+class TargetAssigner:
+    """Optimized target assignment using IoU-based matching"""
+    def __init__(self, positive_threshold: float = 0.5, negative_threshold: float = 0.4):
+        self.positive_threshold = positive_threshold
+        self.negative_threshold = negative_threshold
+
+    def assign_targets(self, anchors: List[torch.Tensor], gt_boxes: torch.Tensor):
+        """Assign ground truth boxes to anchors - optimized"""
+        targets = []
+
+        for level_anchors in anchors:
+            level_targets = self._assign_level_targets(level_anchors, gt_boxes)
+            targets.append(level_targets)
+
+        return targets
+
+    def _assign_level_targets(self, anchors: torch.Tensor, gt_boxes: torch.Tensor):
+        """Assign targets for a single level - optimized"""
+        num_anchors = anchors.shape[0]
+        num_gt = gt_boxes.shape[0]
+
+        if num_gt == 0:
+            return {
+                'cls': torch.zeros(num_anchors, 1),
+                'reg': torch.zeros(num_anchors, 4)
+            }
+
+        # Calculate IoU between anchors and ground truth boxes
+        ious = self._calculate_iou_matrix(anchors, gt_boxes[:, 1:])
+
+        # Find the best IoU for each anchor
+        max_ious, best_gt_idx = ious.max(dim=1)
+
+        # Assign positive and negative samples
+        cls_targets = torch.zeros(num_anchors, 1)
+        reg_targets = torch.zeros(num_anchors, 4)
+
+        # Positive samples
+        positive_mask = max_ious >= self.positive_threshold
+        cls_targets[positive_mask] = 1.0
+
+        # Negative samples
+        negative_mask = max_ious < self.negative_threshold
+        cls_targets[negative_mask] = 0.0
+
+        # Assign regression targets for positive samples
+        if positive_mask.any():
+            positive_anchors = anchors[positive_mask]
+            assigned_gt = gt_boxes[best_gt_idx[positive_mask], 1:]
+            reg_targets[positive_mask] = self._encode_boxes(positive_anchors, assigned_gt)
+
+        return {
+            'cls': cls_targets,
+            'reg': reg_targets
+        }
+
+    def _calculate_iou_matrix(self, anchors: torch.Tensor, gt_boxes: torch.Tensor):
+        """Calculate IoU matrix - optimized"""
+        anchor_corners = self._center_to_corner(anchors)
+        gt_corners = self._center_to_corner(gt_boxes)
+
+        return box_iou(anchor_corners, gt_corners)
+
+    def _center_to_corner(self, boxes: torch.Tensor):
+        """Convert center format to corner format - optimized"""
+        cx, cy, w, h = boxes.unbind(-1)
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    def _encode_boxes(self, anchors: torch.Tensor, gt_boxes: torch.Tensor):
+        """Encode ground truth boxes relative to anchors - optimized"""
+        anchor_cx, anchor_cy, anchor_w, anchor_h = anchors.unbind(-1)
+        gt_cx, gt_cy, gt_w, gt_h = gt_boxes.unbind(-1)
+
+        dx = (gt_cx - anchor_cx) / anchor_w
+        dy = (gt_cy - anchor_cy) / anchor_h
+        dw = torch.log(gt_w / anchor_w + 1e-7)
+        dh = torch.log(gt_h / anchor_h + 1e-7)
+
+        return torch.stack([dx, dy, dw, dh], dim=-1)
+
+# ==============================================================================
+# TPU-OPTIMIZED TRAINING UTILITIES
+# ==============================================================================
+
+def collate_fn_advanced(batch):
+    """Advanced collate function with error handling"""
+    images, targets = zip(*batch)
+
+    # Filter out None values
+    valid_pairs = [(img, tgt) for img, tgt in zip(images, targets)
+                   if img is not None and tgt is not None]
+
+    if not valid_pairs:
+        # Return empty batch
+        return torch.zeros(1, 1, 512, 512), torch.zeros(0, 6)
+
+    images, targets = zip(*valid_pairs)
+
+    # Stack images
+    try:
+        images = torch.stack(images, 0)
+    except Exception as e:
+        print(f"⚠️  Error stacking images: {e}")
+        # Create dummy batch
+        batch_size = len(images)
+        img_size = images[0].shape[-1] if len(images) > 0 else 512
+        images = torch.zeros(batch_size, 1, img_size, img_size)
+
+    # Process targets
+    batch_targets = []
+    for i, target in enumerate(targets):
+        if len(target) > 0:
+            # Add batch index
+            batch_idx = torch.full((len(target), 1), i, dtype=target.dtype)
+            batch_target = torch.cat([batch_idx, target], dim=1)
+            batch_targets.append(batch_target)
+
+    if batch_targets:
+        targets = torch.cat(batch_targets, dim=0)
+    else:
+        targets = torch.zeros(0, 6)  # [batch_idx, class, x, y, w, h]
+
+    return images, targets
+
+class EMAModel:
+    """Exponential Moving Average - Optimized for memory efficiency"""
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+        # Initialize shadow parameters
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        """Update EMA parameters - optimized"""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and name in self.shadow:
+                    self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    def apply_shadow(self):
+        """Apply EMA parameters to model"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self):
+        """Restore original parameters"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+class WarmupCosineScheduler:
+    """Optimized learning rate scheduler"""
+    def __init__(self, optimizer, warmup_epochs: int, total_epochs: int,
+                 min_lr: float = 1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+
+    def step(self, epoch: int):
+        """Update learning rate - optimized"""
+        if epoch < self.warmup_epochs:
+            # Warmup phase
+            lr_scale = epoch / self.warmup_epochs
+        else:
+            # Cosine annealing phase
+            progress = (epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr_scale = 0.5 * (1 + math.cos(math.pi * progress))
+            lr_scale = max(lr_scale, self.min_lr / max(self.base_lrs))
+
+        for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            param_group['lr'] = base_lr * lr_scale
+
+# ==============================================================================
+# MODEL CHECKPOINT MANAGER
+# ==============================================================================
+
+class CheckpointManager:
+    """Advanced checkpoint management with automatic cleanup"""
+    def __init__(self, checkpoint_dir: str, max_checkpoints: int = 5):
+        self.checkpoint_dir = checkpoint_dir
+        self.max_checkpoints = max_checkpoints
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def save_checkpoint(self, model, optimizer, scheduler, ema, epoch,
+                       best_loss, config, is_best=False):
+        """Save checkpoint with metadata"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_loss': best_loss,
+            'config': config,
+            'timestamp': datetime.now().isoformat()
+        }
+
+        # Save regular checkpoint
+        checkpoint_path = os.path.join(
+            self.checkpoint_dir,
+            f'checkpoint_epoch_{epoch+1:03d}.pt'
+        )
+
+        if TPU_AVAILABLE:
+            xm.save(checkpoint, checkpoint_path)
+        else:
+            torch.save(checkpoint, checkpoint_path)
+
+        # Save EMA model
+        ema.apply_shadow()
+        ema_checkpoint = checkpoint.copy()
+        ema_checkpoint['model_state_dict'] = model.state_dict()
+        ema_path = checkpoint_path.replace('.pt', '_ema.pt')
+
+        if TPU_AVAILABLE:
+            xm.save(ema_checkpoint, ema_path)
+        else:
+            torch.save(ema_checkpoint, ema_path)
+
+        ema.restore()
+
+        # Save best model
+        if is_best:
+            best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
+            best_ema_path = os.path.join(self.checkpoint_dir, 'best_model_ema.pt')
+
+            shutil.copy2(checkpoint_path, best_path)
+            shutil.copy2(ema_path, best_ema_path)
+
+        # Cleanup old checkpoints
+        self._cleanup_checkpoints()
+
+        return checkpoint_path, ema_path
+
+    def _cleanup_checkpoints(self):
+        """Remove old checkpoints keeping only the latest N"""
+        checkpoint_files = []
+        for f in os.listdir(self.checkpoint_dir):
+            if f.startswith('checkpoint_epoch_') and f.endswith('.pt') and '_ema' not in f:
+                checkpoint_files.append(f)
+
+        checkpoint_files.sort()
+
+        # Keep only the latest max_checkpoints
+        if len(checkpoint_files) > self.max_checkpoints:
+            for old_file in checkpoint_files[:-self.max_checkpoints]:
+                try:
+                    os.remove(os.path.join(self.checkpoint_dir, old_file))
+                    # Also remove corresponding EMA file
+                    ema_file = old_file.replace('.pt', '_ema.pt')
+                    ema_path = os.path.join(self.checkpoint_dir, ema_file)
+                    if os.path.exists(ema_path):
+                        os.remove(ema_path)
+                except OSError as e:
+                    print(f"⚠️  Could not remove old checkpoint {old_file}: {e}")
+    def load_checkpoint(self, checkpoint_path: str, model, optimizer=None):
+        """Load checkpoint with error handling"""
+        try:
+            if TPU_AVAILABLE:
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            else:
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+            model.load_state_dict(checkpoint['model_state_dict'])
+
+            if optimizer and 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            return checkpoint
+        except Exception as e:
+            print(f"❌ Error loading checkpoint {checkpoint_path}: {e}")
+            return None
+# ==============================================================================
+# MAIN TRAINING FUNCTION (FULLY OPTIMIZED FOR TERMINAL EXECUTION)
+# ==============================================================================
+
+def _mp_fn(rank: int, flags: Dict):
+    """Main training function - Fully optimized for terminal execution"""
+    config = flags['config']
+
+    # Set random seeds for reproducibility
+    torch.manual_seed(config['seed'] + rank)
+    np.random.seed(config['seed'] + rank)
+    random.seed(config['seed'] + rank)
+
+    # Get device (TPU or CPU/GPU)
+    if TPU_AVAILABLE:
+        device = xm.xla_device()
+        world_size = xm.xrt_world_size()
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        world_size = 1
+        rank = 0
+
+    # Initialize logger (only on main process)
+    logger = None
+    checkpoint_manager = None
+    if rank == 0:
+        logger = TrainingLogger(
+            log_dir=config['log_dir'],
+            experiment_name=config['experiment_name']
+        )
+        logger.log_system_info(config)
+
+        checkpoint_manager = CheckpointManager(
+            checkpoint_dir=config['checkpoint_dir'],
+            max_checkpoints=config['max_checkpoints']
+        )
+
+        logger.logger.info(f"🚀 Training on {world_size} {'TPU cores' if TPU_AVAILABLE else 'devices'}")
+        logger.logger.info(f"📦 Model: EfficientCraterDetector (compound_coef={config['compound_coef']})")
+        logger.logger.info(f"🖼️  Image size: {config['img_size']}")
+        logger.logger.info(f"📊 Batch size per core: {config['batch_size']}")
+        logger.logger.info(f"📊 Total batch size: {config['batch_size'] * world_size}")
+
+    # Create datasets with comprehensive error handling
+    try:
+        train_dataset = OptimizedCraterDataset(
+            config['train_img_dir'],
+            config['train_label_dir'],
+            img_size=config['img_size'],
+            augment=True,
+            mosaic_prob=config['mosaic_prob']
+        )
+
+        val_dataset = OptimizedCraterDataset(
+            config['val_img_dir'],
+            config['val_label_dir'],
+            img_size=config['img_size'],
+            augment=False
+        )
+
+        if rank == 0:
+            logger.logger.info(f"📚 Training dataset: {len(train_dataset)} images")
+            logger.logger.info(f"📚 Validation dataset: {len(val_dataset)} images")
+
+    except Exception as e:
+        if rank == 0:
+            print(f"❌ Error creating datasets: {e}")
+        return
+
+    # Create data loaders
+    try:
+        if TPU_AVAILABLE and world_size > 1:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True
+            )
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                val_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=False
+            )
+        else:
+            train_sampler = None
+            val_sampler = None
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config['batch_size'],
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=config['num_workers'],
+            collate_fn=collate_fn_advanced,
+            pin_memory=not TPU_AVAILABLE,
+            drop_last=True,
+            persistent_workers=config['num_workers'] > 0
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config['batch_size'],
+            sampler=val_sampler,
+            shuffle=False,
+            num_workers=config['num_workers'],
+            collate_fn=collate_fn_advanced,
+            pin_memory=not TPU_AVAILABLE,
+            drop_last=False,
+            persistent_workers=config['num_workers'] > 0
+        )
+
+    except Exception as e:
+        if rank == 0:
+            print(f"❌ Error creating data loaders: {e}")
+        return
+
+    # Create model
+    try:
+        model = EfficientCraterDetector(
+            num_classes=config['num_classes'],
+            compound_coef=config['compound_coef']
+        ).to(device)
+
+        if rank == 0:
+            total_params = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.logger.info(f"🔧 Total parameters: {total_params:,}")
+            logger.logger.info(f"🔧 Trainable parameters: {trainable_params:,}")
+
+    except Exception as e:
+        if rank == 0:
+            print(f"❌ Error creating model: {e}")
+        return
+
+    # Create loss function
+    criterion = CombinedLoss(
+        cls_weight=config['cls_weight'],
+        reg_weight=config['reg_weight']
+    )
+
+    # Create optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config['learning_rate'],
+        weight_decay=config['weight_decay'],
+        eps=1e-4,
+        betas=(0.9, 0.999)
+    )
+
+    # Create learning rate scheduler
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_epochs=config['warmup_epochs'],
+        total_epochs=config['epochs'],
+        min_lr=config['min_lr']
+    )
+
+    # Create EMA model
+    ema = EMAModel(model, decay=config['ema_decay'])
+
+    # Create anchor generator and target assigner
+    feature_sizes = [config['img_size'] // stride for stride in [8, 16, 32, 64]]
+    anchor_generator = AnchorGenerator(
+        scales=[1.0, 1.26, 1.59],
+        ratios=[0.5, 1.0, 2.0],
+        strides=[8, 16, 32, 64],
+        img_size=config['img_size']
+    )
+
+    target_assigner = TargetAssigner(
+        positive_threshold=config['positive_threshold'],
+        negative_threshold=config['negative_threshold']
+    )
+
+    # Resume training if checkpoint exists
+    start_epoch = 0
+    best_val_loss = float('inf')
+
+    if config['resume_from_checkpoint']:
+        resume_path = config.get('resume_checkpoint_path')
+        if resume_path and os.path.exists(resume_path):
+            if rank == 0:
+                logger.logger.info(f"🔄 Resuming training from {resume_path}")
+
+            checkpoint = checkpoint_manager.load_checkpoint(resume_path, model, optimizer)
+            if checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint.get('best_loss', float('inf'))
+                if rank == 0:
+                    logger.logger.info(f"✅ Resumed from epoch {start_epoch}, best loss: {best_val_loss:.4f}")
+        elif rank == 0:
+            logger.logger.info("🆕 Starting fresh training (no checkpoint found)")
+
+    # Model compilation for TPU
+    if TPU_AVAILABLE and rank == 0:
+        logger.logger.info("🔧 Compiling model for TPU optimization...")
+        try:
+            dummy_input = torch.randn(1, 1, config['img_size'], config['img_size']).to(device)
+            with torch.no_grad():
+                _ = model(dummy_input)
+            xm.mark_step()
+            logger.logger.info("✅ Model compilation complete")
+        except Exception as e:
+            logger.logger.warning(f"⚠️  Model compilation failed: {e}")
+
+    # Training loop with comprehensive error handling
+    for epoch in range(start_epoch, config['epochs']):
+        try:
+            # Update learning rate
+            scheduler.step(epoch)
+            current_lr = optimizer.param_groups[0]['lr']
+
+            if rank == 0:
+                logger.log_epoch_start(epoch, config['epochs'], current_lr)
+
+            # Training phase
+            model.train()
+            if train_sampler:
+                train_sampler.set_epoch(epoch)
+
+            if TPU_AVAILABLE:
+                para_loader = pl.ParallelLoader(train_loader, [device])
+                train_iter = para_loader.per_device_loader(device)
+            else:
+                train_iter = train_loader
+
+            train_losses = {'total': 0, 'cls': 0, 'reg': 0}
+            num_train_batches = 0
+            train_num_positive = 0
+
+            # Progress bar setup
+            if rank == 0:
+                pbar = tqdm(train_iter, desc=f"Epoch {epoch+1}/{config['epochs']} [Train]")
+            else:
+                pbar = train_iter
+
+            for batch_idx, (images, targets) in enumerate(pbar):
+                try:
+                    # Move to device
+                    images = images.to(device)
+                    targets = targets.to(device)
+
+                    # Zero gradients
+                    optimizer.zero_grad()
+
+                    # Forward pass
+                    predictions = model(images)
+
+                    # Generate anchors
+                    all_anchors = anchor_generator.generate_all_anchors(feature_sizes)
+
+                    # Process targets for each image in batch
+                    batch_size = images.shape[0]
+                    level_targets = [[] for _ in range(len(feature_sizes))]
+
+                    for img_idx in range(batch_size):
+                        # Get targets for current image
+                        img_mask = targets[:, 0] == img_idx
+                        img_targets = targets[img_mask, 1:]
+
+                        # Assign targets to anchors
+                        assigned_targets = target_assigner.assign_targets(all_anchors, img_targets)
+
+                        for level_idx, level_target in enumerate(assigned_targets):
+                            level_targets[level_idx].append(level_target)
+
+                    # Stack targets for each level
+                    for level_idx in range(len(level_targets)):
+                        if level_targets[level_idx]:
+                            stacked_cls = torch.stack([t['cls'] for t in level_targets[level_idx]])
+                            stacked_reg = torch.stack([t['reg'] for t in level_targets[level_idx]])
+                            level_targets[level_idx] = {
+                                'cls': stacked_cls.to(device),
+                                'reg': stacked_reg.to(device)
+                            }
+                        else:
+                            level_targets[level_idx] = {
+                                'cls': torch.zeros(batch_size, len(all_anchors[level_idx]), 1).to(device),
+                                'reg': torch.zeros(batch_size, len(all_anchors[level_idx]), 4).to(device)
+                            }
+
+                    # Calculate loss
+                    loss_dict = criterion(predictions, level_targets)
+                    total_loss = loss_dict['total_loss']
+
+                    # Check for NaN/Inf
+                    if not torch.isfinite(total_loss):
+                        if rank == 0:
+                            logger.logger.warning(f"⚠️  Non-finite loss detected: {total_loss}")
+                        continue
+
+                    # Backward pass
+                    total_loss.backward()
+
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+
+                    # Optimizer step
+                    if TPU_AVAILABLE:
+                        xm.optimizer_step(optimizer)
+                        xm.mark_step()
+                    else:
+                        optimizer.step()
+
+                    # Update EMA
+                    ema.update()
+
+                    # Accumulate losses
+                    train_losses['total'] += loss_dict['total_loss'].item()
+                    train_losses['cls'] += loss_dict['cls_loss'].item()
+                    train_losses['reg'] += loss_dict['reg_loss'].item()
+                    train_num_positive += loss_dict['num_positive']
+                    num_train_batches += 1
+
+                    # Update progress bar
+                    if rank == 0:
+                        pbar.set_postfix({
+                            'loss': f"{loss_dict['total_loss'].item():.4f}",
+                            'cls': f"{loss_dict['cls_loss'].item():.4f}",
+                            'reg': f"{loss_dict['reg_loss'].item():.4f}",
+                            'pos': loss_dict['num_positive'],
+                            'lr': f"{current_lr:.6f}"
+                        })
+
+                    # Memory cleanup
+                    if batch_idx % config['gc_frequency'] == 0:
+                        gc.collect()
+                        if TPU_AVAILABLE:
+                            xm.mark_step()
+                        elif torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                except Exception as e:
+                    if rank == 0:
+                        logger.logger.error(f"❌ Error in training batch {batch_idx}: {e}")
+                    continue
+
+            # Average training losses
+            if num_train_batches > 0:
+                avg_train_losses = {k: v / num_train_batches for k, v in train_losses.items()}
+                avg_train_positive = train_num_positive / num_train_batches
+            else:
+                avg_train_losses = {'total': 0, 'cls': 0, 'reg': 0}
+                avg_train_positive = 0
+
+            # Validation phase
+            model.eval()
+            val_losses = {'total': 0, 'cls': 0, 'reg': 0}
+            val_num_batches = 0
+            val_num_positive = 0
+
+            with torch.no_grad():
+                if TPU_AVAILABLE:
+                    para_val_loader = pl.ParallelLoader(val_loader, [device])
+                    val_iter = para_val_loader.per_device_loader(device)
+                else:
+                    val_iter = val_loader
+
+                if rank == 0:
+                    val_pbar = tqdm(val_iter, desc=f"Epoch {epoch+1}/{config['epochs']} [Val]")
+                else:
+                    val_pbar = val_iter
+
+                for batch_idx, (images, targets) in enumerate(val_pbar):
+                    try:
+                        # Move to device
+                        images = images.to(device)
+                        targets = targets.to(device)
+
+                        # Forward pass
+                        predictions = model(images)
+
+                        # Generate anchors and assign targets (same as training)
+                        all_anchors = anchor_generator.generate_all_anchors(feature_sizes)
+                        batch_size = images.shape[0]
+                        level_targets = [[] for _ in range(len(feature_sizes))]
+
+                        for img_idx in range(batch_size):
+                            img_mask = targets[:, 0] == img_idx
+                            img_targets = targets[img_mask, 1:]
+                            assigned_targets = target_assigner.assign_targets(all_anchors, img_targets)
+
+                            for level_idx, level_target in enumerate(assigned_targets):
+                                level_targets[level_idx].append(level_target)
+
+                        # Stack targets
+                        for level_idx in range(len(level_targets)):
+                            if level_targets[level_idx]:
+                                stacked_cls = torch.stack([t['cls'] for t in level_targets[level_idx]])
+                                stacked_reg = torch.stack([t['reg'] for t in level_targets[level_idx]])
+                                level_targets[level_idx] = {
+                                    'cls': stacked_cls.to(device),
+                                    'reg': stacked_reg.to(device)
+                                }
+                            else:
+                                level_targets[level_idx] = {
+                                    'cls': torch.zeros(batch_size, len(all_anchors[level_idx]), 1).to(device),
+                                    'reg': torch.zeros(batch_size, len(all_anchors[level_idx]), 4).to(device)
+                                }
+
+                        # Calculate loss
+                        loss_dict = criterion(predictions, level_targets)
+
+                        # Check for finite loss
+                        if torch.isfinite(loss_dict['total_loss']):
+                            val_losses['total'] += loss_dict['total_loss'].item()
+                            val_losses['cls'] += loss_dict['cls_loss'].item()
+                            val_losses['reg'] += loss_dict['reg_loss'].item()
+                            val_num_positive += loss_dict['num_positive']
+                            val_num_batches += 1
+
+                        # Update progress bar
+                        if rank == 0:
+                            val_pbar.set_postfix({
+                                'val_loss': f"{loss_dict['total_loss'].item():.4f}",
+                                'val_cls': f"{loss_dict['cls_loss'].item():.4f}",
+                                'val_reg': f"{loss_dict['reg_loss'].item():.4f}",
+                                'val_pos': loss_dict['num_positive']
+                            })
+
+                    except Exception as e:
+                        if rank == 0:
+                            logger.logger.error(f"❌ Error in validation batch {batch_idx}: {e}")
+                        continue
+
+            # Average validation losses
+            if val_num_batches > 0:
+                avg_val_losses = {k: v / val_num_batches for k, v in val_losses.items()}
+                avg_val_positive = val_num_positive / val_num_batches
+
+            else:
+                avg_val_losses = {'total': float('inf'), 'cls': float('inf'), 'reg': float('inf')}
+                avg_val_positive = 0
+
+            # Log epoch results and save checkpoints (only on main process)
+            if rank == 0:
+
+                is_best = avg_val_losses['total'] < best_val_loss
+                if is_best:
+                    best_val_loss = avg_val_losses['total']
+
+                # Direct epoch summary (bypass complex logger)
+                print("="*80)
+                print(f"🔄 EPOCH {epoch+1}/{config['epochs']} COMPLETED")
+                print("="*80)
+                print(f"📊 Train Loss: {avg_train_losses['total']:.4f} (cls: {avg_train_losses['cls']:.4f}, reg: {avg_train_losses['reg']:.4f})")
+                print(f"📊 Val Loss: {avg_val_losses['total']:.4f} (cls: {avg_val_losses['cls']:.4f}, reg: {avg_val_losses['reg']:.4f})")
+
+                if is_best:
+                    print(f"💾 NEW BEST MODEL! Validation Loss: {best_val_loss:.4f}")
+
+                print("="*80)
+
+                # Force output
+                import sys
+                                                # Save checkpoint every epoch (with automatic cleanup)
+                try:
+                    checkpoint_path, ema_path = checkpoint_manager.save_checkpoint(
+                        model, optimizer, scheduler, ema, epoch,
+                        best_val_loss, config, is_best
+                    )
+                    logger.logger.info(f"💾 Checkpoint saved: {os.path.basename(checkpoint_path)}")
+
+                    if is_best:
+                        logger.logger.info("🏆 NEW BEST MODEL SAVED!")
+
+                except Exception as e:
+                    logger.logger.error(f"❌ Error saving checkpoint: {e}")
+
+                # Additional metrics logging
+                logger.logger.info(f"📈 Training Positive Samples: {avg_train_positive:.1f}")
+                logger.logger.info(f"📈 Validation Positive Samples: {avg_val_positive:.1f}")
+
+                # Memory usage logging
+                if torch.cuda.is_available():
+                    memory_used = torch.cuda.max_memory_allocated() / 1024**3
+                    logger.logger.info(f"🔋 GPU Memory Used: {memory_used:.2f} GB")
+
+        except Exception as e:
+            if rank == 0:
+                logger.logger.error(f"❌ Error in epoch {epoch}: {e}")
+                logger.logger.info("🔄 Continuing to next epoch...")
+            continue
+
+    # Training completed
+    if rank == 0:
+        logger.logger.info("="*80)
+        logger.logger.info("🎉 TRAINING COMPLETED SUCCESSFULLY!")
+        logger.logger.info(f"🏆 Best Validation Loss: {best_val_loss:.4f}")
+        logger.logger.info(f"💾 Models saved in: {config['checkpoint_dir']}")
+        logger.logger.info(f"📝 Logs saved in: {config['log_dir']}")
+        logger.logger.info("="*80)
+
+def estimate_training_time(config):
+    """Estimate training time with detailed breakdown"""
+    images_per_epoch = max(len(os.listdir(config['train_img_dir'])), 10000)
+    total_batch_size = config['batch_size'] * (8 if TPU_AVAILABLE else 1)
+    steps_per_epoch = max(images_per_epoch // total_batch_size, 1)
+
+    # Performance estimates
+    if TPU_AVAILABLE:
+        seconds_per_step = 0.4  # Optimized TPU performance
+    elif torch.cuda.is_available():
+        seconds_per_step = 1.2  # GPU performance
+    else:
+        seconds_per_step = 5.0  # CPU performance
+
+    total_steps = steps_per_epoch * config['epochs']
+    estimated_seconds = total_steps * seconds_per_step
+    estimated_hours = estimated_seconds / 3600
+
+    print("\n" + "="*60)
+    print("📊 TRAINING TIME ESTIMATION")
+    print("="*60)
+    print(f"📚 Dataset size (estimated): {images_per_epoch:,} images")
+    print(f"📦 Batch size (total): {total_batch_size}")
+    print(f"🔄 Steps per epoch: {steps_per_epoch}")
+    print(f"🕐 Total epochs: {config['epochs']}")
+    print(f"🚀 Total steps: {total_steps:,}")
+    print(f"⚡ Estimated time per step: {seconds_per_step:.1f}s")
+    print(f"⏰ Estimated training time: {estimated_hours:.1f} hours ({estimated_hours/24:.1f} days)")
+    print(f"🖥️  Training device: {'TPU v2-8' if TPU_AVAILABLE else 'GPU/CPU'}")
+    print("="*60)
+
+    return estimated_hours
+# ==============================================================================
+# INFERENCE AND EVALUATION UTILITIES (OPTIMIZED)
+# ==============================================================================
+
+class CraterDetectorInference:
+    """Optimized inference class with comprehensive error handling"""
+
+    def __init__(self, model_path: str, device: str = 'auto', use_ema: bool = True):
+        # Auto device selection
+        if device == 'auto':
+            if torch.cuda.is_available():
+                device = 'cuda'
+            else:
+                device = 'cpu'
+
+        self.device = device
+        self.img_size = 512  # Should match training
+
+        print(f"🔧 Initializing inference on {device}")
+
+        # Load model with error handling
+        try:
+            self.model = EfficientCraterDetector(num_classes=1, compound_coef=1)
+
+            if use_ema and os.path.exists(model_path.replace('.pt', '_ema.pt')):
+                model_path = model_path.replace('.pt', '_ema.pt')
+                print("✅ Using EMA model for inference")
+
+            if os.path.exists(model_path):
+                state_dict = torch.load(model_path, map_location=device)
+                if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+                    state_dict = state_dict['model_state_dict']
+
+                self.model.load_state_dict(state_dict)
+                print(f"✅ Model loaded from {model_path}")
+            else:
+                print(f"❌ Model file not found: {model_path}")
+                return
+
+            self.model.to(device)
+            self.model.eval()
+
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            return
+
+        # Preprocessing transform
+        self.transform = A.Compose([
+            A.Resize(self.img_size, self.img_size),
+            A.Normalize(mean=[0.5], std=[0.5]),
+            ToTensorV2(),
+        ])
+
+        # Anchor generator for decoding predictions
+        self.anchor_generator = AnchorGenerator(
+            scales=[1.0, 1.26, 1.59],
+            ratios=[0.5, 1.0, 2.0],
+            strides=[8, 16, 32, 64],
+            img_size=self.img_size
+        )
+
+        feature_sizes = [self.img_size // stride for stride in [8, 16, 32, 64]]
+        self.all_anchors = self.anchor_generator.generate_all_anchors(feature_sizes)
+
+        print("🚀 Inference system ready!")
+
+    def preprocess_image(self, image_path: str):
+        """Preprocess image with comprehensive error handling"""
+        try:
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Image file not found: {image_path}")
+
+            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise ValueError(f"Could not load image (cv2.imread returned None)")
+
+            if image.size == 0:
+                raise ValueError(f"Empty image loaded")
+
+            original_size = image.shape[:2]
+            transformed = self.transform(image=image)
+            processed_image = transformed['image'].unsqueeze(0)
+
+            return processed_image, original_size
+
+        except Exception as e:
+            print(f"❌ Error preprocessing image {image_path}: {e}")
+            return None, None
+
+    def decode_predictions(self, cls_outputs: List[torch.Tensor],
+                          reg_outputs: List[torch.Tensor],
+                          confidence_threshold: float = 0.5,
+                          nms_threshold: float = 0.5):
+        """Decode model predictions with optimized NMS"""
+        all_boxes = []
+        all_scores = []
+
+        try:
+            for level_idx, (cls_pred, reg_pred, anchors) in enumerate(
+                zip(cls_outputs, reg_outputs, self.all_anchors)):
+
+                # Apply sigmoid to classification predictions
+                cls_pred = torch.sigmoid(cls_pred.squeeze(0))
+                reg_pred = reg_pred.squeeze(0)
+
+                # Flatten spatial dimensions
+                h, w = cls_pred.shape[:2]
+                cls_pred = cls_pred.view(-1)
+                reg_pred = reg_pred.view(-1, 4)
+
+                # Filter by confidence threshold
+                confident_mask = cls_pred > confidence_threshold
+                if not confident_mask.any():
+                    continue
+
+                confident_scores = cls_pred[confident_mask]
+                confident_reg = reg_pred[confident_mask]
+                confident_anchors = anchors[confident_mask]
+
+                # Decode boxes
+                decoded_boxes = self._decode_boxes(confident_anchors, confident_reg)
+
+                all_boxes.append(decoded_boxes)
+                all_scores.append(confident_scores)
+
+            if not all_boxes:
+                return torch.empty(0, 4), torch.empty(0)
+
+            # Concatenate all levels
+            all_boxes = torch.cat(all_boxes, dim=0)
+            all_scores = torch.cat(all_scores, dim=0)
+
+            # Apply NMS
+            keep_indices = nms(all_boxes, all_scores, nms_threshold)
+
+            return all_boxes[keep_indices], all_scores[keep_indices]
+
+        except Exception as e:
+            print(f"❌ Error decoding predictions: {e}")
+            return torch.empty(0, 4), torch.empty(0)
+
+    def _decode_boxes(self, anchors: torch.Tensor, deltas: torch.Tensor):
+        """Decode regression deltas to absolute box coordinates"""
+        anchor_cx, anchor_cy, anchor_w, anchor_h = anchors.unbind(-1)
+        dx, dy, dw, dh = deltas.unbind(-1)
+
+        # Decode center coordinates
+        pred_cx = dx * anchor_w + anchor_cx
+        pred_cy = dy * anchor_h + anchor_cy
+
+        # Decode width and height (with clamping for stability)
+        pred_w = torch.exp(torch.clamp(dw, max=10)) * anchor_w
+        pred_h = torch.exp(torch.clamp(dh, max=10)) * anchor_h
+
+        # Convert to corner format for NMS
+        x1 = pred_cx - pred_w / 2
+        y1 = pred_cy - pred_h / 2
+        x2 = pred_cx + pred_w / 2
+        y2 = pred_cy + pred_h / 2
+
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    def predict(self, image_path: str, confidence_threshold: float = 0.5,
+                nms_threshold: float = 0.5):
+        """Run inference on a single image"""
+        try:
+            with torch.no_grad():
+                # Preprocess
+                processed_image, original_size = self.preprocess_image(image_path)
+                if processed_image is None:
+                    return torch.empty(0, 4), torch.empty(0)
+
+                processed_image = processed_image.to(self.device)
+
+                # Forward pass
+                predictions = self.model(processed_image)
+
+                # Decode predictions
+                boxes, scores = self.decode_predictions(
+                    predictions['cls_outputs'],
+                    predictions['reg_outputs'],
+                    confidence_threshold,
+                    nms_threshold
+                )
+
+                # Scale boxes back to original image size
+                if len(boxes) > 0:
+                    scale_y = original_size[0] / self.img_size
+                    scale_x = original_size[1] / self.img_size
+
+                    boxes[:, [0, 2]] *= scale_x  # x coordinates
+                    boxes[:, [1, 3]] *= scale_y  # y coordinates
+
+                return boxes, scores
+
+        except Exception as e:
+            print(f"❌ Error during inference: {e}")
+            return torch.empty(0, 4), torch.empty(0)
+
+    def predict_batch(self, image_paths: List[str], confidence_threshold: float = 0.5,
+                     nms_threshold: float = 0.5):
+        """Run inference on multiple images"""
+        results = []
+
+        print(f"🔄 Processing {len(image_paths)} images...")
+        for i, image_path in enumerate(tqdm(image_paths, desc="Inference")):
+            boxes, scores = self.predict(image_path, confidence_threshold, nms_threshold)
+            results.append({
+                'image_path': image_path,
+                'boxes': boxes,
+                'scores': scores,
+                'num_detections': len(boxes)
+            })
+
+            if (i + 1) % 100 == 0:
+                print(f"✅ Processed {i + 1}/{len(image_paths)} images")
+
+        return results
+
+# ==============================================================================
+# CONFIGURATION AND MAIN EXECUTION
+# ==============================================================================
+
+def create_optimized_config():
+    """Create optimized configuration for terminal training"""
+    config = {
+        # Model settings
+        'num_classes': 1,
+        'compound_coef': 1,  # EfficientDet-D1 equivalent
+        'img_size': 512,  # Optimized for TPU (multiple of 128)
+
+        # Training settings - HIGHLY OPTIMIZED
+        'batch_size': 4 if not TPU_AVAILABLE else 32,  # Adjusted for device
+        'epochs': 1000,
+        'learning_rate': 1e-3 if not TPU_AVAILABLE else 2e-3,  # Scaled for TPU
+        'weight_decay': 1e-4,
+        'min_lr': 1e-6,
+        'warmup_epochs': 10,
+        'ema_decay': 0.9,  # Loss settings - OPTIMIZED
+        'cls_weight': 0.5,
+        'reg_weight': 2.0,
+        'positive_threshold': 0.5,
+        'negative_threshold': 0.4,  # Data settings - ENHANCED
+        'mosaic_prob': 0.0,
+        'seed': 42,
+        'gc_frequency': 25,
+        'grad_clip': 0.1,
+
+        'weight_decay': 1e-4,
+        'dropout_rate': 0.1,
+        'label_smoothing': 0.1,
+
+        'early_stopping_patience': 50,
+        'early_stopping_min_delta': 0.001,
+
+        'lr_scheduler': 'cosine_warmup',
+        'warmup_epochs': 10,
+        'min_lr': 1e-6,  # Garbage collection frequency
+
+        # Checkpoint settings - COMPREHENSIVE
+        'checkpoint_dir': 'checkpoints',
+        'log_dir': 'training_logs',
+        'experiment_name': f'crater_detection_{datetime.now().strftime("%Y%m%d_%H%M%S")}',
+        'max_checkpoints': 5,
+        'resume_from_checkpoint': True,
+        'resume_checkpoint_path': None,  # Set to specific path if resuming
+
+        # Paths - CONFIGURABLE
+        'train_img_dir': 'Dataset_sampled/train/images',
+        'train_label_dir': 'Dataset_sampled/train/labels',
+        'val_img_dir': 'Dataset_sampled/val/images',
+        'val_label_dir': 'Dataset_sampled/val/labels',  # Workers and performance
+        'num_workers': 4 if not TPU_AVAILABLE else 0,  # TPU works best with 0
+    }
+
+    return config
+
+# ==============================================================================
+# TERMINAL EXECUTION AND ARGUMENT PARSING
+# ==============================================================================
+
+def parse_arguments():
+    """Parse command line arguments for flexible training"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Optimized Crater Detection Training')
+
+    # Training parameters
+    parser.add_argument('--epochs', type=int, default=200, help='Number of training epochs')
+    parser.add_argument('--batch-size', type=int, default=64 if TPU_AVAILABLE else 32,
+                       help='Batch size per device')
+    parser.add_argument('--lr', type=float, default=2e-3 if TPU_AVAILABLE else 1e-3,
+                       help='Learning rate')
+    parser.add_argument('--img-size', type=int, default=512, help='Input image size')
+
+    # Data paths
+    parser.add_argument('--train-img-dir', type=str, required=True,
+                       help='Training images directory')
+    parser.add_argument('--train-label-dir', type=str, required=True,
+                       help='Training labels directory')
+    parser.add_argument('--val-img-dir', type=str, required=True,
+                       help='Validation images directory')
+    parser.add_argument('--val-label-dir', type=str, required=True,
+                       help='Validation labels directory')
+
+    # Checkpoint settings
+    parser.add_argument('--checkpoint-dir', type=str, default='checkpoints',
+                       help='Checkpoint directory')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume from checkpoint path')
+    parser.add_argument('--experiment-name', type=str, default=None,
+                       help='Experiment name for logging')
+
+    # Model settings
+    parser.add_argument('--compound-coef', type=int, default=1,
+                       help='EfficientDet compound coefficient (0-4)')
+
+    return parser.parse_args()
+
+def validate_directories(config):
+    """Validate that all required directories exist"""
+    required_dirs = [
+        'train_img_dir', 'train_label_dir',
+        'val_img_dir', 'val_label_dir'
+    ]
+
+    missing_dirs = []
+    for dir_key in required_dirs:
+        if not os.path.exists(config[dir_key]):
+            missing_dirs.append(f"{dir_key}: {config[dir_key]}")
+
+    if missing_dirs:
+        print("❌ ERROR: The following directories do not exist:")
+        for missing in missing_dirs:
+            print(f"   - {missing}")
+        print("\n💡 Please check your dataset paths and try again.")
+        return False
+
+    return True
+
+def display_training_info(config):
+    """Display comprehensive training information"""
+    print("\n" + "="*80)
+    print("🚀 CRATER DETECTION TRAINING - OPTIMIZED FOR TERMINAL")
+    print("="*80)
+
+    print(f"📊 **TRAINING CONFIGURATION**")
+    print(f"   • Model: EfficientCraterDetector (D{config['compound_coef']})")
+    print(f"   • Image Size: {config['img_size']}×{config['img_size']}")
+    print(f"   • Epochs: {config['epochs']}")
+    print(f"   • Batch Size: {config['batch_size']} per core")
+
+    if TPU_AVAILABLE:
+        total_batch = config['batch_size'] * 8
+        device_info = "TPU v2-8 (8 cores)"
+    else:
+        total_batch = config['batch_size']
+        device_info = "GPU/CPU"
+
+    print(f"   • Total Batch Size: {total_batch}")
+    print(f"   • Learning Rate: {config['learning_rate']}")
+    print(f"   • Device: {device_info}")
+
+    print(f"\n📁 **DATASET PATHS**")
+    print(f"   • Train Images: {config['train_img_dir']}")
+    print(f"   • Train Labels: {config['train_label_dir']}")
+    print(f"   • Val Images: {config['val_img_dir']}")
+    print(f"   • Val Labels: {config['val_label_dir']}")
+
+    print(f"\n💾 **CHECKPOINTS & LOGGING**")
+    print(f"   • Checkpoint Dir: {config['checkpoint_dir']}")
+    print(f"   • Log Dir: {config['log_dir']}")
+    print(f"   • Experiment: {config['experiment_name']}")
+
+    if config['resume_from_checkpoint'] and config.get('resume_checkpoint_path'):
+        print(f"   • Resuming from: {config['resume_checkpoint_path']}")
+
+    print("="*80)
+
+# ==============================================================================
+# COMPREHENSIVE INFERENCE SYSTEM
+# ==============================================================================
+
+class CraterDetectorInference:
+    """Production-ready inference system with comprehensive error handling"""
+
+    def __init__(self, model_path: str, device: str = 'auto', use_ema: bool = True,
+                 img_size: int = 512, compound_coef: int = 1):
+        print("🔧 Initializing Crater Detection Inference System...")
+
+        # Device selection
+        if device == 'auto':
+            if torch.cuda.is_available():
+                device = 'cuda'
+                print("✅ Using GPU for inference")
+            else:
+                device = 'cpu'
+                print("⚠️  Using CPU for inference (GPU not available)")
+
+        self.device = device
+        self.img_size = img_size
+        self.compound_coef = compound_coef
+
+        # Load model
+        try:
+            self.model = EfficientCraterDetector(
+                num_classes=1,
+                compound_coef=compound_coef
+            )
+
+            # Check for EMA model first
+            if use_ema:
+                ema_path = model_path.replace('.pt', '_ema.pt')
+                if os.path.exists(ema_path):
+                    model_path = ema_path
+                    print("✅ Using EMA model for better performance")
+
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Model file not found: {model_path}")
+
+            # Load checkpoint
+            checkpoint = torch.load(model_path, map_location=device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                print(f"✅ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+            else:
+                state_dict = checkpoint
+
+            self.model.load_state_dict(state_dict)
+            self.model.to(device)
+            self.model.eval()
+
+            print(f"✅ Model loaded successfully from {os.path.basename(model_path)}")
+
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            raise
+
+        # Setup preprocessing
+        self.transform = A.Compose([
+            A.Resize(img_size, img_size),
+            A.Normalize(mean=[0.5], std=[0.5]),
+            ToTensorV2(),
+        ])
+
+        # Setup anchor generation
+        self.anchor_generator = AnchorGenerator(
+            scales=[1.0, 1.26, 1.59],
+            ratios=[0.5, 1.0, 2.0],
+            strides=[8, 16, 32, 64],
+            img_size=img_size
+        )
+
+        feature_sizes = [img_size // stride for stride in [8, 16, 32, 64]]
+        self.all_anchors = self.anchor_generator.generate_all_anchors(feature_sizes)
+
+        print("🚀 Inference system ready!")
+
+    def preprocess_image(self, image_path: str):
+        """Preprocess image with comprehensive error handling"""
+        try:
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Image file not found: {image_path}")
+
+            # Load image
+            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise ValueError(f"Could not load image (corrupted or unsupported format)")
+
+            if image.size == 0:
+                raise ValueError(f"Empty image loaded")
+
+            original_size = image.shape[:2]
+            print(f"📷 Loaded image: {os.path.basename(image_path)} "
+                  f"({original_size[1]}×{original_size[0]})")
+
+            # Apply preprocessing
+            transformed = self.transform(image=image)
+            processed_image = transformed['image'].unsqueeze(0)
+
+            return processed_image, original_size
+
+        except Exception as e:
+            print(f"❌ Error preprocessing image {image_path}: {e}")
+            return None, None
+
+    def decode_predictions(self, cls_outputs: List[torch.Tensor],
+                          reg_outputs: List[torch.Tensor],
+                          confidence_threshold: float = 0.5,
+                          nms_threshold: float = 0.5):
+        """Decode model predictions with optimized NMS"""
+        all_boxes = []
+        all_scores = []
+
+        try:
+            for level_idx, (cls_pred, reg_pred, anchors) in enumerate(
+                zip(cls_outputs, reg_outputs, self.all_anchors)):
+
+                # Apply sigmoid to get probabilities
+                cls_pred = torch.sigmoid(cls_pred.squeeze(0))
+                reg_pred = reg_pred.squeeze(0)
+
+                # Flatten spatial dimensions
+                h, w = cls_pred.shape[:2]
+                cls_pred = cls_pred.view(-1)
+                reg_pred = reg_pred.view(-1, 4)
+
+                # Filter by confidence
+                confident_mask = cls_pred > confidence_threshold
+                if not confident_mask.any():
+                    continue
+
+                confident_scores = cls_pred[confident_mask]
+                confident_reg = reg_pred[confident_mask]
+                confident_anchors = anchors[confident_mask]
+
+                # Decode boxes
+                decoded_boxes = self._decode_boxes(confident_anchors, confident_reg)
+
+                all_boxes.append(decoded_boxes)
+                all_scores.append(confident_scores)
+
+            if not all_boxes:
+                return torch.empty(0, 4), torch.empty(0)
+
+            # Concatenate all pyramid levels
+            all_boxes = torch.cat(all_boxes, dim=0)
+            all_scores = torch.cat(all_scores, dim=0)
+
+            # Apply Non-Maximum Suppression
+            keep_indices = nms(all_boxes, all_scores, nms_threshold)
+
+            final_boxes = all_boxes[keep_indices]
+            final_scores = all_scores[keep_indices]
+
+            print(f"🎯 Detected {len(final_boxes)} craters after NMS")
+
+            return final_boxes, final_scores
+
+        except Exception as e:
+            print(f"❌ Error decoding predictions: {e}")
+            return torch.empty(0, 4), torch.empty(0)
+
+    def _decode_boxes(self, anchors: torch.Tensor, deltas: torch.Tensor):
+        """Decode regression deltas to absolute coordinates"""
+        anchor_cx, anchor_cy, anchor_w, anchor_h = anchors.unbind(-1)
+        dx, dy, dw, dh = deltas.unbind(-1)
+
+        # Decode center coordinates
+        pred_cx = dx * anchor_w + anchor_cx
+        pred_cy = dy * anchor_h + anchor_cy
+
+        # Decode dimensions with clamping for stability
+        pred_w = torch.exp(torch.clamp(dw, max=10)) * anchor_w
+        pred_h = torch.exp(torch.clamp(dh, max=10)) * anchor_h
+
+        # Convert to corner format
+        x1 = pred_cx - pred_w / 2
+        y1 = pred_cy - pred_h / 2
+        x2 = pred_cx + pred_w / 2
+        y2 = pred_cy + pred_h / 2
+
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    def predict(self, image_path: str, confidence_threshold: float = 0.5,
+                nms_threshold: float = 0.5, save_visualization: bool = True):
+        """Run complete inference pipeline"""
+        try:
+            with torch.no_grad():
+                # Preprocess
+                processed_image, original_size = self.preprocess_image(image_path)
+                if processed_image is None:
+                    return torch.empty(0, 4), torch.empty(0)
+
+                processed_image = processed_image.to(self.device)
+
+                print("🔄 Running inference...")
+                start_time = time.time()
+
+                # Forward pass
+                predictions = self.model(processed_image)
+
+                inference_time = time.time() - start_time
+                print(f"⚡ Inference completed in {inference_time:.3f}s")
+
+                # Decode predictions
+                boxes, scores = self.decode_predictions(
+                    predictions['cls_outputs'],
+                    predictions['reg_outputs'],
+                    confidence_threshold,
+                    nms_threshold
+                )
+
+                # Scale boxes to original image size
+                if len(boxes) > 0:
+                    scale_y = original_size[0] / self.img_size
+                    scale_x = original_size[1] / self.img_size
+
+                    boxes[:, [0, 2]] *= scale_x
+                    boxes[:, [1, 3]] *= scale_y
+
+                # Save visualization if requested
+                if save_visualization and len(boxes) > 0:
+                    output_path = image_path.replace('.', '_detected.')
+                    self.visualize_detections(image_path, boxes, scores, output_path)
+
+                return boxes, scores
+
+        except Exception as e:
+            print(f"❌ Error during inference: {e}")
+            return torch.empty(0, 4), torch.empty(0)
+
+    def visualize_detections(self, image_path: str, boxes: torch.Tensor,
+                           scores: torch.Tensor, output_path: str = None):
+        """Create visualization with detected craters"""
+        try:
+            # Load original image
+            image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+            image_color = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+            # Draw detections
+            for box, score in zip(boxes, scores):
+                x1, y1, x2, y2 = box.cpu().numpy().astype(int)
+
+                # Draw bounding box
+                cv2.rectangle(image_color, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+                # Draw confidence score
+                label = f'{score:.3f}'
+                label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+                cv2.rectangle(image_color, (x1, y1 - label_size[1] - 10),
+                            (x1 + label_size[0], y1), (255, 0, 0), -1)
+                cv2.putText(image_color, label, (x1, y1 - 5),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Save visualization
+            if output_path is None:
+                output_path = image_path.replace('.', '_detected.')
+
+            cv2.imwrite(output_path, image_color)
+            print(f"💾 Visualization saved: {output_path}")
+
+        except Exception as e:
+            print(f"❌ Error creating visualization: {e}")
+
+# ==============================================================================
+# MAIN EXECUTION FUNCTION
+# ==============================================================================
+
+def main():
+    """Main execution function - Terminal ready"""
+    print("\n🌙 EFFICIENT CRATER DETECTOR - TERMINAL TRAINING")
+    print("=" * 60)
+
+    # Parse command line arguments if provided
+    try:
+        args = parse_arguments()
+
+        # Create configuration from arguments
+        config = create_optimized_config()
+
+        # Override with command line arguments
+        config.update({
+            'epochs': args.epochs,
+            'batch_size': args.batch_size,
+            'learning_rate': args.lr,
+            'img_size': args.img_size,
+            'train_img_dir': args.train_img_dir,
+            'train_label_dir': args.train_label_dir,
+            'val_img_dir': args.val_img_dir,
+            'val_label_dir': args.val_label_dir,
+            'checkpoint_dir': args.checkpoint_dir,
+            'compound_coef': args.compound_coef,
+        })
+
+        if args.resume:
+            config['resume_from_checkpoint'] = True
+            config['resume_checkpoint_path'] = args.resume
+
+        if args.experiment_name:
+            config['experiment_name'] = args.experiment_name
+
+    except SystemExit:
+        # No command line arguments provided, use default config
+        config = create_optimized_config()
+        print("💡 Using default configuration (no command line args provided)")
+
+    # Validate configuration
+    if not validate_directories(config):
+        return
+
+    # Display training information
+    display_training_info(config)
+
+    # Estimate training time
+    estimated_hours = estimate_training_time(config)
+
+    # Confirm before starting
+    response = input()
+    if response != 'y':
+        print("Training cancelled.")
+        return
+
+    # Create directories
+    os.makedirs(config['checkpoint_dir'], exist_ok=True)
+    os.makedirs(config['log_dir'], exist_ok=True)
+
+    print(f"\n🎯 Starting training for {estimated_hours:.1f} hours...")
+    print("📝 Output will be displayed in real-time!")
+    print("💾 Models will be saved after each epoch")
+    print("🔄 Training can be resumed if interrupted")
+    print("\n" + "="*60)
+
+    # Launch training
+    try:
+        if TPU_AVAILABLE:
+            # TPU training
+            flags = {'config': config}
+            xmp.spawn(_mp_fn, args=(flags,), nprocs=8, start_method='spawn')
+        else:
+            # Single device training
+            _mp_fn(0, {'config': config})
+
+    except KeyboardInterrupt:
+        print("\n⚠️  Training interrupted by user")
+        print("💾 Latest checkpoint should be available for resuming")
+    except Exception as e:
+        print(f"\n❌ Training failed with error: {e}")
+        print("💡 Check logs for detailed error information")
+
+# ==============================================================================
+# EXAMPLE USAGE FUNCTIONS
+# ==============================================================================
+
+def run_inference_example():
+    """Example of running inference on trained model"""
+    print("\n🔍 INFERENCE EXAMPLE")
+    print("="*40)
+
+    model_path = input("Enter model path (or press Enter for 'best_model.pt'): ").strip()
+    if not model_path:
+        model_path = "checkpoints/best_model.pt"
+
+    image_path = input("Enter image path: ").strip()
+    if not image_path or not os.path.exists(image_path):
+        print("❌ Invalid image path")
+        return
+
+    try:
+        # Initialize detector
+        detector = CraterDetectorInference(
+            model_path=model_path,
+            device='auto',
+            use_ema=True
+        )
+
+        # Run inference
+        boxes, scores = detector.predict(
+            image_path,
+            confidence_threshold=0.5,
+            nms_threshold=0.5,
+            save_visualization=True
+        )
+
+        print(f"\n🎯 RESULTS:")
+        print(f"   • Found {len(boxes)} craters")
+        if len(boxes) > 0:
+            print(f"   • Confidence range: {scores.min():.3f} - {scores.max():.3f}")
+            print(f"   • Visualization saved")
+
+    except Exception as e:
+        print(f"❌ Inference failed: {e}")
+
+def show_help():
+    """Display help information"""
+    print("""
+🌙 EFFICIENT CRATER DETECTOR - HELP
+═══════════════════════════════════════
+
+USAGE:
+  python script.py [OPTIONS]
+
+REQUIRED ARGUMENTS:
+  --train-img-dir PATH     Training images directory
+  --train-label-dir PATH   Training labels directory
+  --val-img-dir PATH       Validation images directory
+  --val-label-dir PATH     Validation labels directory
+
+OPTIONAL ARGUMENTS:
+  --epochs N              Number of epochs (default: 200)
+  --batch-size N          Batch size per device (default: 64 for TPU, 32 for GPU)
+  --lr FLOAT              Learning rate (default: 2e-3 for TPU, 1e-3 for GPU)
+  --img-size N            Input image size (default: 512)
+  --checkpoint-dir PATH   Checkpoint directory (default: checkpoints)
+  --resume PATH           Resume from checkpoint
+  --experiment-name NAME  Custom experiment name
+  --compound-coef N       Model size 0-4 (default: 1)
+
+EXAMPLES:
+  # Basic training
+  python script.py --train-img-dir data/train/images --train-label-dir data/train/labels \\
+                   --val-img-dir data/val/images --val-label-dir data/val/labels
+
+  # Resume training
+  python script.py --resume checkpoints/checkpoint_epoch_050.pt [other args...]
+
+  # Custom configuration
+  python script.py --epochs 300 --batch-size 128 --lr 3e-3 [data args...]
+
+FEATURES:
+  ✅ Real-time terminal output with progress bars
+  ✅ Automatic model saving after each epoch
+  ✅ Resume training from any checkpoint
+  ✅ Comprehensive logging and metrics
+  ✅ TPU/GPU/CPU automatic detection
+  ✅ Memory optimization and error handling
+  ✅ EMA (Exponential Moving Average) models
+  ✅ Advanced data augmentations
+  ✅ Training time estimation
+
+The script will show you estimated training time and ask for confirmation before starting.
+    """)
+
+# ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    import sys
+
+    # Check for help
+    if len(sys.argv) > 1 and sys.argv[1] in ['--help', '-h', 'help']:
+        show_help()
+        sys.exit(0)
+
+    # Check for inference mode
+    if len(sys.argv) > 1 and sys.argv[1] == 'inference':
+        run_inference_example()
+        sys.exit(0)
+
+    # Run main training
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        print("\n💡 Run with '--help' for usage information")
+        sys.exit(1)
+
+print("🎉 Crater Detection Training Script Ready!")
+print("💡 Run with '--help' for detailed usage information")
